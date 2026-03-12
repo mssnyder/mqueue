@@ -47,6 +47,10 @@ mod imp {
 
         #[property(get, set)]
         account_id: Cell<i64>,
+
+        /// Account email shown as badge in unified view (empty if single-account).
+        #[property(get, set)]
+        account_email: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -77,6 +81,7 @@ impl MessageObject {
         has_attachments: bool,
         mailbox: &str,
         account_id: i64,
+        account_email: &str,
     ) -> Self {
         glib::Object::builder()
             .property("db-id", db_id)
@@ -91,6 +96,7 @@ impl MessageObject {
             .property("has-attachments", has_attachments)
             .property("mailbox", mailbox)
             .property("account-id", account_id)
+            .property("account-email", account_email)
             .build()
     }
 }

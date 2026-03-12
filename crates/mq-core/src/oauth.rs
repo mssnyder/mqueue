@@ -12,6 +12,8 @@ use crate::error::{MqError, Result};
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GMAIL_SCOPE: &str = "https://mail.google.com/";
+const OPENID_SCOPE: &str = "openid";
+const EMAIL_SCOPE: &str = "email";
 
 /// OAuth2 client with auth and token endpoints configured.
 pub type GoogleClient =
@@ -74,6 +76,8 @@ pub fn authorization_url(
     let (auth_url, csrf_token) = client
         .authorize_url(CsrfToken::new_random)
         .add_scope(Scope::new(GMAIL_SCOPE.to_string()))
+        .add_scope(Scope::new(OPENID_SCOPE.to_string()))
+        .add_scope(Scope::new(EMAIL_SCOPE.to_string()))
         .add_extra_param("access_type", "offline")
         .add_extra_param("prompt", "consent")
         .set_pkce_challenge(pkce_challenge)
@@ -137,6 +141,120 @@ pub async fn refresh_access_token(
         refresh_token: new_refresh,
         expires_in,
     })
+}
+
+/// Run a local HTTP server to catch the OAuth redirect callback.
+///
+/// Listens on `127.0.0.1:{port}`, waits for a single GET request with
+/// `code` and `state` query parameters, verifies the CSRF state, and
+/// returns the authorization code.
+pub async fn run_callback_server(port: u16, expected_state: &str) -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .map_err(|e| MqError::OAuth(format!("Failed to bind callback server: {e}")))?;
+
+    info!("OAuth callback server listening on port {port}");
+
+    let (mut stream, _) = listener
+        .accept()
+        .await
+        .map_err(|e| MqError::OAuth(format!("Failed to accept connection: {e}")))?;
+
+    let mut buf = vec![0u8; 4096];
+    let n = stream
+        .read(&mut buf)
+        .await
+        .map_err(|e| MqError::OAuth(format!("Failed to read request: {e}")))?;
+
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let first_line = request
+        .lines()
+        .next()
+        .ok_or_else(|| MqError::OAuth("Empty HTTP request".into()))?;
+
+    // Parse "GET /callback?code=xxx&state=yyy HTTP/1.1"
+    let path = first_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| MqError::OAuth("Invalid HTTP request".into()))?;
+
+    let url = url::Url::parse(&format!("http://localhost{path}"))
+        .map_err(|e| MqError::OAuth(format!("Failed to parse callback URL: {e}")))?;
+
+    let params: std::collections::HashMap<String, String> =
+        url.query_pairs().into_owned().collect();
+
+    if let Some(error) = params.get("error") {
+        let body = format!(
+            "<html><body><h1>Authentication Failed</h1><p>{error}</p>\
+             <p>You can close this tab.</p></body></html>"
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        return Err(MqError::OAuth(format!("OAuth error: {error}")));
+    }
+
+    let code = params
+        .get("code")
+        .ok_or_else(|| MqError::OAuth("No authorization code in callback".into()))?
+        .clone();
+
+    let state = params
+        .get("state")
+        .ok_or_else(|| MqError::OAuth("No state parameter in callback".into()))?;
+
+    if state != expected_state {
+        let body = "<html><body><h1>Security Error</h1>\
+                    <p>State mismatch. Please try again.</p></body></html>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        return Err(MqError::OAuth("CSRF state mismatch".into()));
+    }
+
+    let body = "<html><body><h1>Authentication Successful!</h1>\
+                <p>You can close this tab and return to m'Queue.</p></body></html>";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+
+    info!("OAuth callback received successfully");
+    Ok(code)
+}
+
+/// Fetch the authenticated user's email and display name from Google.
+pub async fn get_user_info(access_token: &str) -> Result<(String, Option<String>)> {
+    #[derive(serde::Deserialize)]
+    struct UserInfo {
+        email: String,
+        name: Option<String>,
+    }
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://www.googleapis.com/oauth2/v3/userinfo")
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|e| MqError::OAuth(format!("Failed to fetch user info: {e}")))?;
+
+    let info: UserInfo = resp
+        .json()
+        .await
+        .map_err(|e| MqError::OAuth(format!("Failed to parse user info: {e}")))?;
+
+    info!(email = %info.email, "Fetched user info");
+    Ok((info.email, info.name))
 }
 
 /// Build the XOAUTH2 SASL string for IMAP/SMTP authentication.

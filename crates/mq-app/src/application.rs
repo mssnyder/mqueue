@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use adw::prelude::*;
@@ -7,6 +10,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config;
 use crate::runtime;
+use crate::widgets::account_setup::MqAccountSetup;
 use crate::widgets::message_object::MessageObject;
 use crate::widgets::window::MqWindow;
 
@@ -27,21 +31,58 @@ pub fn run() -> i32 {
         let window = MqWindow::new(app);
         window.present();
 
-        // Initialize database and load data
         setup_data(&window);
     });
 
     app.run().into()
 }
 
-/// Set up data layer: init DB, load accounts, trigger sync.
+// ---------------------------------------------------------------------------
+// Data types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct AccountInfo {
+    id: i64,
+    email: String,
+    display_name: Option<String>,
+}
+
+struct AppData {
+    accounts: Vec<AccountInfo>,
+    messages: Vec<MessageData>,
+    account_emails: HashMap<i64, String>,
+    pool: Arc<SqlitePool>,
+}
+
+#[derive(Clone)]
+struct MessageData {
+    db_id: i64,
+    uid: u32,
+    sender_name: String,
+    sender_email: String,
+    subject: String,
+    date: String,
+    snippet: String,
+    is_read: bool,
+    is_flagged: bool,
+    has_attachments: bool,
+    mailbox: String,
+    account_id: i64,
+    recipient_to: String,
+    list_unsubscribe: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Initialisation
+// ---------------------------------------------------------------------------
+
+/// Set up data layer: init DB, load accounts, load initial messages.
 fn setup_data(window: &MqWindow) {
     let window_clone = window.clone();
 
     runtime::spawn_async(
         async move {
-            // Initialize database
-            let _config = mq_core::config::AppConfig::load().unwrap_or_default();
             let db_path = mq_core::config::AppConfig::data_dir().join("mq-mail.db");
 
             let pool = match mq_db::init_pool(&db_path).await {
@@ -52,225 +93,479 @@ fn setup_data(window: &MqWindow) {
                 }
             };
 
-            // Check for existing accounts
             let accounts = mq_db::queries::accounts::get_all_accounts(&pool)
                 .await
                 .unwrap_or_default();
 
+            let account_infos: Vec<AccountInfo> = accounts
+                .iter()
+                .map(|a| AccountInfo {
+                    id: a.id,
+                    email: a.email.clone(),
+                    display_name: a.display_name.clone(),
+                })
+                .collect();
+
+            let account_emails: HashMap<i64, String> =
+                accounts.iter().map(|a| (a.id, a.email.clone())).collect();
+
             if accounts.is_empty() {
-                info!("No accounts configured — showing welcome screen");
+                info!("No accounts configured — showing account setup");
                 return Ok(AppData {
-                    has_accounts: false,
+                    accounts: account_infos,
                     messages: vec![],
+                    account_emails,
                     pool: Arc::new(pool),
                 });
             }
 
-            info!(
-                count = accounts.len(),
-                "Found existing accounts, loading messages"
-            );
+            info!(count = accounts.len(), "Loading unified inbox");
 
-            // Load messages for the first account's inbox
-            let account = &accounts[0];
-            let messages = mq_db::queries::messages::get_messages_for_mailbox(
-                &pool,
-                account.id,
-                "INBOX",
-                100,
-                0,
-            )
-            .await
-            .unwrap_or_default();
+            // Unified inbox: all accounts' INBOX
+            let messages =
+                mq_db::queries::messages::get_messages_all_accounts_for_mailbox(
+                    &pool, "INBOX", 200, 0,
+                )
+                .await
+                .unwrap_or_default();
 
-            info!(count = messages.len(), "Loaded cached messages");
+            info!(count = messages.len(), "Loaded cached messages (unified)");
 
             Ok(AppData {
-                has_accounts: true,
-                messages: messages
-                    .into_iter()
-                    .map(|m| MessageData {
-                        db_id: m.id,
-                        uid: m.uid as u32,
-                        sender_name: m.sender_name.unwrap_or_default(),
-                        sender_email: m.sender_email,
-                        subject: m.subject.unwrap_or_default(),
-                        date: m.date,
-                        snippet: m.snippet.unwrap_or_default(),
-                        is_read: m.flags.contains("\\Seen"),
-                        is_flagged: m.flags.contains("\\Flagged"),
-                        has_attachments: m.has_attachments,
-                        mailbox: m.mailbox,
-                        account_id: m.account_id,
-                        recipient_to: m.recipient_to,
-                        list_unsubscribe: m.list_unsubscribe,
-                    })
-                    .collect(),
+                accounts: account_infos,
+                messages: db_to_message_data(messages),
+                account_emails,
                 pool: Arc::new(pool),
             })
         },
-        move |result: Result<AppData, String>| {
-            match result {
-                Ok(data) => {
-                    if !data.has_accounts {
-                        return;
-                    }
-
-                    let pool = data.pool.clone();
-
-                    // Populate the message list with cached data
-                    let message_list = window_clone.message_list();
-                    let objects: Vec<MessageObject> = data
-                        .messages
-                        .iter()
-                        .map(|m| {
-                            MessageObject::new(
-                                m.db_id,
-                                m.uid,
-                                &m.sender_name,
-                                &m.sender_email,
-                                &m.subject,
-                                &m.date,
-                                &m.snippet,
-                                m.is_read,
-                                m.is_flagged,
-                                m.has_attachments,
-                                &m.mailbox,
-                                m.account_id,
-                            )
-                        })
-                        .collect();
-                    message_list.set_messages(objects);
-
-                    // Wire message selection to load full message details
-                    let message_view = window_clone.message_view();
-                    let messages_data = Arc::new(data.messages);
-                    message_list.connect_message_selected(move |msg| {
-                        let db_id = msg.db_id();
-                        let from = if msg.sender_name().is_empty() {
-                            msg.sender_email()
-                        } else {
-                            format!("{} <{}>", msg.sender_name(), msg.sender_email())
-                        };
-
-                        // Find the full message data for To/unsubscribe fields
-                        let msg_data = messages_data.iter().find(|m| m.db_id == db_id);
-                        let to = msg_data
-                            .map(|m| m.recipient_to.as_str())
-                            .unwrap_or("");
-                        let has_unsub = msg_data
-                            .map(|m| m.list_unsubscribe.is_some())
-                            .unwrap_or(false);
-
-                        // Show headers immediately with snippet
-                        message_view.show_message(
-                            &from,
-                            to,
-                            &msg.date(),
-                            &msg.subject(),
-                            &msg.snippet(),
-                            has_unsub,
-                            msg.is_flagged(),
-                            msg.is_read(),
-                        );
-
-                        // Async-load the cached body (if available)
-                        let pool = pool.clone();
-                        let view = message_view.clone();
-                        runtime::spawn_async(
-                            async move {
-                                load_message_body(&pool, db_id).await
-                            },
-                            move |body: Option<String>| {
-                                if let Some(text) = body {
-                                    view.set_body_text(&text);
-                                }
-                            },
-                        );
-                    });
-
-                    // Wire action button callbacks
-                    let pool2 = data.pool.clone();
-                    let ml2 = window_clone.message_list();
-                    window_clone.message_view().connect_star_toggled(move |starred| {
-                        if let Some(msg) = selected_message(&ml2) {
-                            let db_id = msg.db_id();
-                            let pool = pool2.clone();
-                            msg.set_is_flagged(starred);
-                            debug!(db_id, starred, "Star toggled");
-                            runtime::spawn_async(
-                                async move {
-                                    toggle_flag(&pool, db_id, "\\Flagged", starred).await;
-                                },
-                                |_| {},
-                            );
-                        }
-                    });
-
-                    let pool3 = data.pool.clone();
-                    let ml3 = window_clone.message_list();
-                    window_clone.message_view().connect_read_toggled(move |read| {
-                        if let Some(msg) = selected_message(&ml3) {
-                            let db_id = msg.db_id();
-                            let pool = pool3.clone();
-                            msg.set_is_read(read);
-                            debug!(db_id, read, "Read toggled");
-                            runtime::spawn_async(
-                                async move {
-                                    toggle_flag(&pool, db_id, "\\Seen", read).await;
-                                },
-                                |_| {},
-                            );
-                        }
-                    });
-
-                    let pool4 = data.pool.clone();
-                    let ml4 = window_clone.message_list();
-                    let view4 = window_clone.message_view();
-                    window_clone.message_view().connect_delete_clicked(move || {
-                        if let Some(msg) = selected_message(&ml4) {
-                            let db_id = msg.db_id();
-                            let pool = pool4.clone();
-                            debug!(db_id, "Delete clicked");
-                            remove_selected(&ml4);
-                            view4.show_placeholder();
-                            runtime::spawn_async(
-                                async move {
-                                    if let Err(e) =
-                                        mq_db::queries::messages::delete_message(&pool, db_id).await
-                                    {
-                                        warn!("Failed to delete message: {e}");
-                                    }
-                                },
-                                |_| {},
-                            );
-                        }
-                    });
-
-                    let ml5 = window_clone.message_list();
-                    let view5 = window_clone.message_view();
-                    window_clone.message_view().connect_archive_clicked(move || {
-                        if let Some(msg) = selected_message(&ml5) {
-                            debug!(db_id = msg.db_id(), "Archive clicked");
-                            remove_selected(&ml5);
-                            view5.show_placeholder();
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Failed to load data: {e}");
-                    window_clone.show_banner(&format!("Error: {e}"));
-                }
+        move |result: Result<AppData, String>| match result {
+            Ok(data) => setup_ui(window_clone, data),
+            Err(e) => {
+                error!("Failed to load data: {e}");
+                window_clone.show_banner(&format!("Error: {e}"));
             }
         },
     );
 }
 
-/// Load the cached body for a message from the database.
+/// Wire up the entire UI after data loads.
+fn setup_ui(window: MqWindow, data: AppData) {
+    let pool = data.pool.clone();
+    let account_emails = Arc::new(data.account_emails);
+    let is_multi_account = data.accounts.len() > 1;
+
+    // Populate sidebar with accounts
+    let sidebar = window.sidebar();
+    let tuples: Vec<(i64, String, Option<String>)> = data
+        .accounts
+        .iter()
+        .map(|a| (a.id, a.email.clone(), a.display_name.clone()))
+        .collect();
+    sidebar.set_accounts(&tuples);
+
+    // No accounts → show setup dialog
+    if data.accounts.is_empty() {
+        show_account_setup(&window, &pool);
+        return;
+    }
+
+    // Shared messages data — updated on each reload, read by selection handler.
+    let shared_messages: Rc<RefCell<Vec<MessageData>>> =
+        Rc::new(RefCell::new(data.messages.clone()));
+
+    // Populate message list (unified view)
+    let show_badge = is_multi_account;
+    let objects = make_message_objects(&data.messages, &account_emails, show_badge);
+    window.message_list().set_messages(objects);
+
+    // Wire message selection (ONCE — reads from shared_messages)
+    {
+        let view = window.message_view();
+        let pool_sel = pool.clone();
+        let msgs = shared_messages.clone();
+
+        window
+            .message_list()
+            .connect_message_selected(move |msg| {
+                let db_id = msg.db_id();
+                let from = if msg.sender_name().is_empty() {
+                    msg.sender_email()
+                } else {
+                    format!("{} <{}>", msg.sender_name(), msg.sender_email())
+                };
+
+                let msgs = msgs.borrow();
+                let msg_data = msgs.iter().find(|m| m.db_id == db_id);
+                let to = msg_data.map(|m| m.recipient_to.as_str()).unwrap_or("");
+                let has_unsub = msg_data
+                    .map(|m| m.list_unsubscribe.is_some())
+                    .unwrap_or(false);
+
+                view.show_message(
+                    &from,
+                    to,
+                    &msg.date(),
+                    &msg.subject(),
+                    &msg.snippet(),
+                    has_unsub,
+                    msg.is_flagged(),
+                    msg.is_read(),
+                );
+
+                let pool = pool_sel.clone();
+                let v = view.clone();
+                runtime::spawn_async(
+                    async move { load_message_body(&pool, db_id).await },
+                    move |body: Option<String>| {
+                        if let Some(text) = body {
+                            v.set_body_text(&text);
+                        }
+                    },
+                );
+            });
+    }
+
+    // Wire action buttons
+    wire_action_buttons(&window, &pool);
+
+    // Wire sidebar: account selection → reload messages
+    {
+        let w = window.clone();
+        let p = pool.clone();
+        let e = account_emails.clone();
+        let m = shared_messages.clone();
+        let n = data.accounts.len();
+        sidebar.connect_account_selected(move |account_id| {
+            let mailbox = w.sidebar().selected_mailbox();
+            reload_messages(&w, &p, account_id, &mailbox, &e, n > 1, &m);
+        });
+    }
+
+    // Wire sidebar: mailbox selection → reload messages
+    {
+        let w = window.clone();
+        let p = pool.clone();
+        let e = account_emails.clone();
+        let m = shared_messages.clone();
+        let n = data.accounts.len();
+        sidebar.connect_mailbox_selected(move |mailbox| {
+            let account_id = w.sidebar().selected_account_id();
+            reload_messages(&w, &p, account_id, mailbox, &e, n > 1, &m);
+        });
+    }
+
+    // Wire "Add Account"
+    {
+        let w = window.clone();
+        let p = pool.clone();
+        sidebar.connect_add_account(move || {
+            show_account_setup(&w, &p);
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Account setup
+// ---------------------------------------------------------------------------
+
+fn show_account_setup(window: &MqWindow, pool: &Arc<SqlitePool>) {
+    let dialog = MqAccountSetup::new(window);
+    dialog.present();
+
+    let dialog_ref = dialog.clone();
+    let pool = pool.clone();
+    let window = window.clone();
+
+    dialog.connect_sign_in(move || {
+        dialog_ref.show_loading();
+
+        let dialog = dialog_ref.clone();
+        let pool = pool.clone();
+        let window = window.clone();
+
+        runtime::spawn_async(
+            async move {
+                let config = mq_core::config::AppConfig::load().unwrap_or_default();
+                let client_id = config
+                    .resolve_client_id()
+                    .ok()
+                    .flatten()
+                    .ok_or("OAuth client_id not configured in config.toml")?;
+                let client_secret = config
+                    .resolve_client_secret()
+                    .ok()
+                    .flatten()
+                    .ok_or("OAuth client_secret not configured in config.toml")?;
+
+                let port = mq_core::oauth::find_free_port()
+                    .map_err(|e| format!("{e}"))?;
+                let client =
+                    mq_core::oauth::build_client(&client_id, &client_secret, port)
+                        .map_err(|e| format!("{e}"))?;
+
+                let (auth_url, csrf_token, pkce_verifier) =
+                    mq_core::oauth::authorization_url(&client);
+
+                // Open browser
+                let _ = gio::AppInfo::launch_default_for_uri(
+                    &auth_url,
+                    None::<&gio::AppLaunchContext>,
+                );
+
+                // Wait for redirect
+                let code =
+                    mq_core::oauth::run_callback_server(port, csrf_token.secret())
+                        .await
+                        .map_err(|e| format!("{e}"))?;
+
+                // Exchange for tokens
+                let tokens =
+                    mq_core::oauth::exchange_code(&client, code, pkce_verifier)
+                        .await
+                        .map_err(|e| format!("{e}"))?;
+
+                // Get user email
+                let (email, display_name) =
+                    mq_core::oauth::get_user_info(&tokens.access_token)
+                        .await
+                        .map_err(|e| format!("{e}"))?;
+
+                // Save to DB
+                let account_id = mq_db::queries::accounts::insert_account(
+                    &pool,
+                    &email,
+                    display_name.as_deref(),
+                )
+                .await
+                .map_err(|e| format!("Failed to save account: {e}"))?;
+
+                info!(account_id, %email, "Account added successfully");
+
+                // TODO: Store refresh_token in keyring (Phase 6)
+                if tokens.refresh_token.is_some() {
+                    debug!("Refresh token obtained (keyring storage deferred)");
+                }
+
+                Ok((email, pool))
+            },
+            move |result: Result<(String, Arc<SqlitePool>), String>| match result {
+                Ok((email, pool)) => {
+                    dialog.show_success(&email);
+
+                    // Refresh sidebar account list
+                    let window2 = window.clone();
+                    runtime::spawn_async(
+                        async move {
+                            mq_db::queries::accounts::get_all_accounts(&pool)
+                                .await
+                                .unwrap_or_default()
+                        },
+                        move |db_accounts| {
+                            let tuples: Vec<(i64, String, Option<String>)> = db_accounts
+                                .iter()
+                                .map(|a| (a.id, a.email.clone(), a.display_name.clone()))
+                                .collect();
+                            window2.sidebar().set_accounts(&tuples);
+                        },
+                    );
+                }
+                Err(e) => {
+                    error!("Account setup failed: {e}");
+                    dialog.show_error(&e);
+                }
+            },
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Message loading
+// ---------------------------------------------------------------------------
+
+fn reload_messages(
+    window: &MqWindow,
+    pool: &Arc<SqlitePool>,
+    account_id: Option<i64>,
+    mailbox: &str,
+    account_emails: &Arc<HashMap<i64, String>>,
+    is_multi_account: bool,
+    shared_messages: &Rc<RefCell<Vec<MessageData>>>,
+) {
+    let mailbox = mailbox.to_string();
+    let show_badge = is_multi_account && account_id.is_none();
+    let pool = pool.clone();
+    let emails = account_emails.clone();
+    let msgs = shared_messages.clone();
+    let ml = window.message_list();
+    let mv = window.message_view();
+
+    runtime::spawn_async(
+        async move {
+            let messages = match account_id {
+                Some(aid) => mq_db::queries::messages::get_messages_for_mailbox(
+                    &pool, aid, &mailbox, 200, 0,
+                )
+                .await
+                .unwrap_or_default(),
+                None => {
+                    mq_db::queries::messages::get_messages_all_accounts_for_mailbox(
+                        &pool, &mailbox, 200, 0,
+                    )
+                    .await
+                    .unwrap_or_default()
+                }
+            };
+            (db_to_message_data(messages), emails, show_badge)
+        },
+        move |(messages, emails, show_badge): (
+            Vec<MessageData>,
+            Arc<HashMap<i64, String>>,
+            bool,
+        )| {
+            let objects = make_message_objects(&messages, &emails, show_badge);
+            // Update shared state so the selection handler has current data
+            *msgs.borrow_mut() = messages;
+            ml.set_messages(objects);
+            mv.show_placeholder();
+        },
+    );
+}
+
+fn db_to_message_data(messages: Vec<mq_db::models::DbMessage>) -> Vec<MessageData> {
+    messages
+        .into_iter()
+        .map(|m| MessageData {
+            db_id: m.id,
+            uid: m.uid as u32,
+            sender_name: m.sender_name.unwrap_or_default(),
+            sender_email: m.sender_email,
+            subject: m.subject.unwrap_or_default(),
+            date: m.date,
+            snippet: m.snippet.unwrap_or_default(),
+            is_read: m.flags.contains("\\Seen"),
+            is_flagged: m.flags.contains("\\Flagged"),
+            has_attachments: m.has_attachments,
+            mailbox: m.mailbox,
+            account_id: m.account_id,
+            recipient_to: m.recipient_to,
+            list_unsubscribe: m.list_unsubscribe,
+        })
+        .collect()
+}
+
+fn make_message_objects(
+    messages: &[MessageData],
+    account_emails: &HashMap<i64, String>,
+    show_badge: bool,
+) -> Vec<MessageObject> {
+    messages
+        .iter()
+        .map(|m| {
+            let badge = if show_badge {
+                account_emails
+                    .get(&m.account_id)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            MessageObject::new(
+                m.db_id,
+                m.uid,
+                &m.sender_name,
+                &m.sender_email,
+                &m.subject,
+                &m.date,
+                &m.snippet,
+                m.is_read,
+                m.is_flagged,
+                m.has_attachments,
+                &m.mailbox,
+                m.account_id,
+                &badge,
+            )
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Message selection & actions
+// ---------------------------------------------------------------------------
+
+fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>) {
+    let pool2 = pool.clone();
+    let ml2 = window.message_list();
+    window
+        .message_view()
+        .connect_star_toggled(move |starred| {
+            if let Some(msg) = selected_message(&ml2) {
+                let db_id = msg.db_id();
+                let pool = pool2.clone();
+                msg.set_is_flagged(starred);
+                debug!(db_id, starred, "Star toggled");
+                runtime::spawn_async(
+                    async move { toggle_flag(&pool, db_id, "\\Flagged", starred).await },
+                    |_| {},
+                );
+            }
+        });
+
+    let pool3 = pool.clone();
+    let ml3 = window.message_list();
+    window.message_view().connect_read_toggled(move |read| {
+        if let Some(msg) = selected_message(&ml3) {
+            let db_id = msg.db_id();
+            let pool = pool3.clone();
+            msg.set_is_read(read);
+            debug!(db_id, read, "Read toggled");
+            runtime::spawn_async(
+                async move { toggle_flag(&pool, db_id, "\\Seen", read).await },
+                |_| {},
+            );
+        }
+    });
+
+    let pool4 = pool.clone();
+    let ml4 = window.message_list();
+    let view4 = window.message_view();
+    window.message_view().connect_delete_clicked(move || {
+        if let Some(msg) = selected_message(&ml4) {
+            let db_id = msg.db_id();
+            let pool = pool4.clone();
+            debug!(db_id, "Delete clicked");
+            remove_selected(&ml4);
+            view4.show_placeholder();
+            runtime::spawn_async(
+                async move {
+                    if let Err(e) =
+                        mq_db::queries::messages::delete_message(&pool, db_id).await
+                    {
+                        warn!("Failed to delete message: {e}");
+                    }
+                },
+                |_| {},
+            );
+        }
+    });
+
+    let ml5 = window.message_list();
+    let view5 = window.message_view();
+    window.message_view().connect_archive_clicked(move || {
+        if let Some(msg) = selected_message(&ml5) {
+            debug!(db_id = msg.db_id(), "Archive clicked");
+            remove_selected(&ml5);
+            view5.show_placeholder();
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 async fn load_message_body(pool: &SqlitePool, message_id: i64) -> Option<String> {
     match mq_db::queries::message_bodies::get_body(pool, message_id).await {
         Ok(Some(body)) => {
-            // Prefer text body for Phase 2; HTML rendering comes in Phase 5
             if let Some(text) = body.text_body {
                 Some(text)
             } else if let Some(html) = body.html_body {
@@ -287,7 +582,6 @@ async fn load_message_body(pool: &SqlitePool, message_id: i64) -> Option<String>
     }
 }
 
-/// Toggle a flag in the database for a message.
 async fn toggle_flag(pool: &SqlitePool, message_id: i64, flag: &str, add: bool) {
     let current: Result<Option<String>, sqlx::Error> =
         sqlx::query_scalar("SELECT flags FROM messages WHERE id = ?")
@@ -318,26 +612,19 @@ async fn toggle_flag(pool: &SqlitePool, message_id: i64, flag: &str, add: bool) 
                 warn!("Failed to update flags: {e}");
             }
         }
-        Ok(None) => {
-            warn!(message_id, "Message not found for flag update");
-        }
-        Err(e) => {
-            warn!("Failed to read flags: {e}");
-        }
+        Ok(None) => warn!(message_id, "Message not found for flag update"),
+        Err(e) => warn!("Failed to read flags: {e}"),
     }
 }
 
-/// Get the currently selected MessageObject from a message list.
 fn selected_message(
     list: &crate::widgets::message_list::MqMessageList,
 ) -> Option<MessageObject> {
-    let selection = list.selection();
-    selection
+    list.selection()
         .selected_item()
         .and_then(|item| item.downcast::<MessageObject>().ok())
 }
 
-/// Remove the currently selected item from the message list.
 fn remove_selected(list: &crate::widgets::message_list::MqMessageList) {
     let selection = list.selection();
     let pos = selection.selected();
@@ -347,7 +634,6 @@ fn remove_selected(list: &crate::widgets::message_list::MqMessageList) {
     }
 }
 
-/// Very basic HTML tag stripper for Phase 2 fallback.
 fn strip_html_tags(html: &str) -> String {
     let mut result = String::with_capacity(html.len());
     let mut in_tag = false;
@@ -365,7 +651,6 @@ fn strip_html_tags(html: &str) -> String {
         .join(" ")
 }
 
-/// Load custom CSS for the application.
 fn load_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_data(
@@ -381,6 +666,17 @@ fn load_css() {
         .navigation-sidebar row {
             min-height: 36px;
         }
+
+        .caption {
+            font-size: 0.8em;
+        }
+
+        .heading {
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            font-size: 0.75em;
+        }
         ",
     );
 
@@ -389,28 +685,4 @@ fn load_css() {
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
-}
-
-/// Intermediate data types for passing between async and GTK threads.
-struct AppData {
-    has_accounts: bool,
-    messages: Vec<MessageData>,
-    pool: Arc<SqlitePool>,
-}
-
-struct MessageData {
-    db_id: i64,
-    uid: u32,
-    sender_name: String,
-    sender_email: String,
-    subject: String,
-    date: String,
-    snippet: String,
-    is_read: bool,
-    is_flagged: bool,
-    has_attachments: bool,
-    mailbox: String,
-    account_id: i64,
-    recipient_to: String,
-    list_unsubscribe: Option<String>,
 }

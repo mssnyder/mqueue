@@ -152,6 +152,31 @@ pub async fn get_highest_uid(
     Ok(row.get("max_uid"))
 }
 
+/// Get messages across ALL accounts for a given mailbox (unified inbox view).
+pub async fn get_messages_all_accounts_for_mailbox(
+    pool: &SqlitePool,
+    mailbox: &str,
+    limit: i64,
+    offset: i64,
+) -> sqlx::Result<Vec<DbMessage>> {
+    sqlx::query_as::<_, DbMessage>(
+        "SELECT id, account_id, uid, mailbox, gmail_msg_id, gmail_thread_id,
+            message_id, in_reply_to, references_json,
+            sender_name, sender_email, recipient_to, recipient_cc,
+            subject, snippet, date, flags, has_attachments, body_structure,
+            list_unsubscribe, list_unsubscribe_post, modseq, uid_validity, cached_at
+        FROM messages
+        WHERE mailbox = ?
+        ORDER BY date DESC
+        LIMIT ? OFFSET ?",
+    )
+    .bind(mailbox)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn search_fts(
     pool: &SqlitePool,
     query: &str,

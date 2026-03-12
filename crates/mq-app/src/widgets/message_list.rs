@@ -158,6 +158,17 @@ fn create_message_row() -> gtk::Box {
     snippet_label.set_widget_name("snippet");
     row.append(&snippet_label);
 
+    // Account email badge (hidden unless unified view)
+    let account_label = gtk::Label::builder()
+        .hexpand(true)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .css_classes(["dim-label", "caption"])
+        .visible(false)
+        .build();
+    account_label.set_widget_name("account");
+    row.append(&account_label);
+
     row
 }
 
@@ -220,6 +231,18 @@ fn bind_message_row(row: &gtk::Box, msg: &MessageObject) {
     if let Some(snippet) = find_child_by_name(row, "snippet") {
         let snippet = snippet.downcast::<gtk::Label>().unwrap();
         snippet.set_label(&msg.snippet());
+    }
+
+    // Account badge (visible only in unified view)
+    if let Some(account) = find_child_by_name(row, "account") {
+        let account = account.downcast::<gtk::Label>().unwrap();
+        let email = msg.account_email();
+        if email.is_empty() {
+            account.set_visible(false);
+        } else {
+            account.set_label(&email);
+            account.set_visible(true);
+        }
     }
 }
 
