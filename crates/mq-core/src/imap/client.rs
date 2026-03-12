@@ -64,14 +64,21 @@ impl ImapSession {
         Ok(names)
     }
 
-    /// SELECT a mailbox, returning metadata.
+    /// SELECT a mailbox, returning metadata including CONDSTORE info.
     pub async fn select(&mut self, mailbox: &str) -> Result<MailboxInfo> {
         let mbox = self.session.select(mailbox).await?;
         let info = MailboxInfo {
             exists: mbox.exists,
             uid_validity: mbox.uid_validity,
+            highest_modseq: mbox.highest_modseq,
         };
-        debug!(mailbox, exists = info.exists, "Selected mailbox");
+        debug!(
+            mailbox,
+            exists = info.exists,
+            uid_validity = ?info.uid_validity,
+            highest_modseq = ?info.highest_modseq,
+            "Selected mailbox"
+        );
         Ok(info)
     }
 
@@ -149,11 +156,13 @@ impl ImapSession {
     }
 }
 
-/// Basic mailbox metadata returned by SELECT.
+/// Mailbox metadata returned by SELECT, including CONDSTORE fields.
 #[derive(Debug, Clone)]
 pub struct MailboxInfo {
     pub exists: u32,
     pub uid_validity: Option<u32>,
+    /// HIGHESTMODSEQ for CONDSTORE delta sync.
+    pub highest_modseq: Option<u64>,
 }
 
 /// XOAUTH2 authenticator for async-imap.

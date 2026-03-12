@@ -1,4 +1,5 @@
 pub mod account;
+pub mod body;
 pub mod config;
 pub mod email;
 pub mod error;
