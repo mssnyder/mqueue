@@ -1,0 +1,28 @@
+[package]
+name = "mq-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mq-mail"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-journald = { workspace = true }
+tracing-appender = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+
+mq-core = { path = "../mq-core" }
+mq-db = { path = "../mq-db" }
+mq-net = { path = "../mq-net" }
+
+gtk = { package = "gtk4", version = "0.11" }
+adw = { package = "libadwaita", version = "0.9" }
+gio = "0.22"
+glib = "0.22"
