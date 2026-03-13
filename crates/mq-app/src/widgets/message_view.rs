@@ -25,6 +25,9 @@ mod imp {
         pub read_button: RefCell<Option<gtk::ToggleButton>>,
         pub archive_button: RefCell<Option<gtk::Button>>,
         pub delete_button: RefCell<Option<gtk::Button>>,
+        pub reply_button: RefCell<Option<gtk::Button>>,
+        pub reply_all_button: RefCell<Option<gtk::Button>>,
+        pub forward_button: RefCell<Option<gtk::Button>>,
         pub loading_spinner: RefCell<Option<gtk::Spinner>>,
     }
 
@@ -70,10 +73,28 @@ mod imp {
                 .css_classes(["destructive-action"])
                 .build();
 
+            let reply_button = gtk::Button::builder()
+                .icon_name("mail-reply-sender-symbolic")
+                .tooltip_text("Reply")
+                .build();
+
+            let reply_all_button = gtk::Button::builder()
+                .icon_name("mail-reply-all-symbolic")
+                .tooltip_text("Reply All")
+                .build();
+
+            let forward_button = gtk::Button::builder()
+                .icon_name("mail-forward-symbolic")
+                .tooltip_text("Forward")
+                .build();
+
             header.pack_end(&delete_button);
             header.pack_end(&archive_button);
             header.pack_end(&read_button);
             header.pack_end(&star_button);
+            header.pack_start(&reply_button);
+            header.pack_start(&reply_all_button);
+            header.pack_start(&forward_button);
 
             widget.append(&header);
 
@@ -256,6 +277,9 @@ mod imp {
             *self.read_button.borrow_mut() = Some(read_button);
             *self.archive_button.borrow_mut() = Some(archive_button);
             *self.delete_button.borrow_mut() = Some(delete_button);
+            *self.reply_button.borrow_mut() = Some(reply_button);
+            *self.reply_all_button.borrow_mut() = Some(reply_all_button);
+            *self.forward_button.borrow_mut() = Some(forward_button);
             *self.loading_spinner.borrow_mut() = Some(spinner);
         }
     }
@@ -376,6 +400,27 @@ impl MqMessageView {
     /// Connect a callback for the delete button.
     pub fn connect_delete_clicked<F: Fn() + 'static>(&self, f: F) {
         if let Some(btn) = self.imp().delete_button.borrow().as_ref() {
+            btn.connect_clicked(move |_| f());
+        }
+    }
+
+    /// Connect a callback for the reply button.
+    pub fn connect_reply_clicked<F: Fn() + 'static>(&self, f: F) {
+        if let Some(btn) = self.imp().reply_button.borrow().as_ref() {
+            btn.connect_clicked(move |_| f());
+        }
+    }
+
+    /// Connect a callback for the reply-all button.
+    pub fn connect_reply_all_clicked<F: Fn() + 'static>(&self, f: F) {
+        if let Some(btn) = self.imp().reply_all_button.borrow().as_ref() {
+            btn.connect_clicked(move |_| f());
+        }
+    }
+
+    /// Connect a callback for the forward button.
+    pub fn connect_forward_clicked<F: Fn() + 'static>(&self, f: F) {
+        if let Some(btn) = self.imp().forward_button.borrow().as_ref() {
             btn.connect_clicked(move |_| f());
         }
     }

@@ -11,6 +11,7 @@ use tracing::{debug, error, info, warn};
 use crate::config;
 use crate::runtime;
 use crate::widgets::account_setup::MqAccountSetup;
+use crate::widgets::compose_window::{ComposeMode, MqComposeWindow};
 use crate::widgets::message_object::MessageObject;
 use crate::widgets::window::MqWindow;
 
@@ -225,8 +226,11 @@ fn setup_ui(window: MqWindow, data: AppData) {
             });
     }
 
-    // Wire action buttons
+    // Wire action buttons (star, read, delete, archive)
     wire_action_buttons(&window, &pool);
+
+    // Wire compose & reply buttons
+    wire_compose_buttons(&window, &pool, &data.accounts, &shared_messages);
 
     // Wire sidebar: account selection → reload messages
     {
@@ -557,6 +561,234 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>) {
             view5.show_placeholder();
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Compose
+// ---------------------------------------------------------------------------
+
+fn wire_compose_buttons(
+    window: &MqWindow,
+    pool: &Arc<SqlitePool>,
+    accounts: &[AccountInfo],
+    shared_messages: &Rc<RefCell<Vec<MessageData>>>,
+) {
+    let account_tuples: Vec<(i64, String)> = accounts
+        .iter()
+        .map(|a| (a.id, a.email.clone()))
+        .collect();
+
+    // Compose new message
+    {
+        let w = window.clone();
+        let accts = account_tuples.clone();
+        window.message_list().connect_compose_clicked(move || {
+            open_compose(&w, &accts, ComposeMode::New, None);
+        });
+    }
+
+    // Reply
+    {
+        let w = window.clone();
+        let ml = window.message_list();
+        let accts = account_tuples.clone();
+        let pool = pool.clone();
+        window.message_view().connect_reply_clicked(move || {
+            if let Some(msg) = selected_message(&ml) {
+                let db_id = msg.db_id();
+                let from = format_sender(&msg);
+                let subject = msg.subject();
+                let date = msg.date();
+                let account_id = msg.account_id();
+                let accts = accts.clone();
+                let w = w.clone();
+                let pool = pool.clone();
+                runtime::spawn_async(
+                    async move { load_message_body(&pool, db_id).await },
+                    move |body: Option<String>| {
+                        let body_text = body.unwrap_or_default();
+                        let mode = ComposeMode::Reply {
+                            from: from.clone(),
+                            subject: subject.clone(),
+                            date: date.clone(),
+                            body: body_text,
+                            message_id: None,
+                            references: None,
+                        };
+                        open_compose(&w, &accts, mode, Some(account_id));
+                    },
+                );
+            }
+        });
+    }
+
+    // Reply All
+    {
+        let w = window.clone();
+        let ml = window.message_list();
+        let accts = account_tuples.clone();
+        let msgs = shared_messages.clone();
+        let pool = pool.clone();
+        window.message_view().connect_reply_all_clicked(move || {
+            if let Some(msg) = selected_message(&ml) {
+                let db_id = msg.db_id();
+                let from = format_sender(&msg);
+                let subject = msg.subject();
+                let date = msg.date();
+                let msgs = msgs.borrow();
+                let msg_data = msgs.iter().find(|m| m.db_id == db_id);
+                let to_str = msg_data.map(|m| m.recipient_to.clone()).unwrap_or_default();
+                let to_addrs: Vec<String> = to_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let account_id = msg.account_id();
+                let accts = accts.clone();
+                let w = w.clone();
+                let pool = pool.clone();
+                runtime::spawn_async(
+                    async move { load_message_body(&pool, db_id).await },
+                    move |body: Option<String>| {
+                        let body_text = body.unwrap_or_default();
+                        let mode = ComposeMode::ReplyAll {
+                            from: from.clone(),
+                            to: to_addrs,
+                            cc: vec![],
+                            subject: subject.clone(),
+                            date: date.clone(),
+                            body: body_text,
+                            message_id: None,
+                            references: None,
+                        };
+                        open_compose(&w, &accts, mode, Some(account_id));
+                    },
+                );
+            }
+        });
+    }
+
+    // Forward
+    {
+        let w = window.clone();
+        let ml = window.message_list();
+        let accts = account_tuples.clone();
+        let msgs = shared_messages.clone();
+        let pool = pool.clone();
+        window.message_view().connect_forward_clicked(move || {
+            if let Some(msg) = selected_message(&ml) {
+                let db_id = msg.db_id();
+                let from = format_sender(&msg);
+                let subject = msg.subject();
+                let date = msg.date();
+                let msgs = msgs.borrow();
+                let msg_data = msgs.iter().find(|m| m.db_id == db_id);
+                let to = msg_data.map(|m| m.recipient_to.clone()).unwrap_or_default();
+                let account_id = msg.account_id();
+                let accts = accts.clone();
+                let w = w.clone();
+                let pool = pool.clone();
+                runtime::spawn_async(
+                    async move { load_message_body(&pool, db_id).await },
+                    move |body: Option<String>| {
+                        let body_text = body.unwrap_or_default();
+                        let mode = ComposeMode::Forward {
+                            from: from.clone(),
+                            subject: subject.clone(),
+                            date: date.clone(),
+                            to,
+                            body: body_text,
+                        };
+                        open_compose(&w, &accts, mode, Some(account_id));
+                    },
+                );
+            }
+        });
+    }
+}
+
+fn open_compose(
+    window: &MqWindow,
+    accounts: &[(i64, String)],
+    mode: ComposeMode,
+    selected_account_id: Option<i64>,
+) {
+    let config = mq_core::config::AppConfig::load().unwrap_or_default();
+    let signature = config.compose.default_signature;
+
+    let compose = MqComposeWindow::new(window);
+    compose.set_accounts(accounts);
+    if let Some(aid) = selected_account_id {
+        compose.select_account(aid);
+    }
+    compose.apply_mode(&mode, &signature);
+
+    let (in_reply_to, references) = MqComposeWindow::reply_headers(&mode);
+
+    // Wire Send button
+    let compose_ref = compose.clone();
+    compose.connect_send(move || {
+        let Some((_, from_email)) = compose_ref.selected_account() else {
+            warn!("No account selected for sending");
+            return;
+        };
+
+        let to = compose_ref.to_addresses();
+        if to.is_empty() {
+            warn!("No recipients specified");
+            return;
+        }
+
+        let email = mq_core::smtp::OutgoingEmail {
+            from_email: from_email.clone(),
+            from_name: None,
+            to,
+            cc: compose_ref.cc_addresses(),
+            bcc: compose_ref.bcc_addresses(),
+            subject: compose_ref.subject(),
+            body_text: compose_ref.body_text(),
+            body_html: None,
+            in_reply_to: in_reply_to.clone(),
+            references: references.clone(),
+        };
+
+        info!(to = ?email.to, subject = %email.subject, "Sending email");
+
+        // TODO: Get access token from keyring (Phase 6).
+        // For now, log a placeholder message.
+        let compose_close = compose_ref.clone();
+        runtime::spawn_async(
+            async move {
+                // When token storage is implemented, this will call:
+                // mq_core::smtp::send_email(&email, &access_token).await
+                warn!(
+                    "SMTP send deferred: token storage not yet implemented. \
+                     Would send to {:?} with subject '{}'",
+                    email.to, email.subject
+                );
+                Ok::<(), String>(())
+            },
+            move |result: Result<(), String>| match result {
+                Ok(()) => {
+                    info!("Compose window closing (send queued)");
+                    compose_close.close();
+                }
+                Err(e) => {
+                    error!("Failed to send: {e}");
+                }
+            },
+        );
+    });
+
+    compose.present();
+}
+
+fn format_sender(msg: &MessageObject) -> String {
+    if msg.sender_name().is_empty() {
+        msg.sender_email()
+    } else {
+        format!("{} <{}>", msg.sender_name(), msg.sender_email())
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ mod imp {
         pub list_view: RefCell<Option<gtk::ListView>>,
         pub model: RefCell<Option<gio::ListStore>>,
         pub selection: RefCell<Option<gtk::SingleSelection>>,
+        pub compose_button: RefCell<Option<gtk::Button>>,
     }
 
     #[glib::object_subclass]
@@ -39,6 +40,12 @@ mod imp {
 
             let title = adw::WindowTitle::new("Inbox", "");
             header.set_title_widget(Some(&title));
+
+            let compose_button = gtk::Button::builder()
+                .icon_name("document-edit-symbolic")
+                .tooltip_text("Compose")
+                .build();
+            header.pack_end(&compose_button);
 
             widget.append(&header);
 
@@ -93,6 +100,7 @@ mod imp {
             *self.list_view.borrow_mut() = Some(list_view);
             *self.model.borrow_mut() = Some(model);
             *self.selection.borrow_mut() = Some(selection);
+            *self.compose_button.borrow_mut() = Some(compose_button);
         }
     }
 
@@ -326,6 +334,13 @@ impl MqMessageList {
         model.remove_all();
         for msg in messages {
             model.append(&msg);
+        }
+    }
+
+    /// Connect a callback for the Compose button.
+    pub fn connect_compose_clicked<F: Fn() + 'static>(&self, f: F) {
+        if let Some(btn) = self.imp().compose_button.borrow().as_ref() {
+            btn.connect_clicked(move |_| f());
         }
     }
 
