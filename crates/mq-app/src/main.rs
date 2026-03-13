@@ -20,8 +20,10 @@ fn main() {
 fn init_logging() {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+    let config = mq_core::config::AppConfig::load().unwrap_or_default();
+
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+        .unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr);
@@ -30,8 +32,35 @@ fn init_logging() {
         .with(filter)
         .with(fmt_layer);
 
-    // Optional journald logging (configured at runtime in later phases)
-    // Optional file logging (configured at runtime in later phases)
+    // Optional journald logging
+    if config.logging.journald_enabled {
+        match tracing_journald::layer() {
+            Ok(journald_layer) => {
+                registry.with(journald_layer).init();
+                return;
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to initialize journald logging: {e}");
+            }
+        }
+    }
+
+    // Optional file logging
+    if config.logging.file_enabled {
+        let log_dir = config
+            .logging
+            .file_path
+            .clone()
+            .unwrap_or_else(|| mq_core::config::AppConfig::data_dir().join("logs"));
+        if let Ok(()) = std::fs::create_dir_all(&log_dir) {
+            let file_appender = tracing_appender::rolling::daily(&log_dir, "mq-mail.log");
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_writer(file_appender)
+                .with_ansi(false);
+            registry.with(file_layer).init();
+            return;
+        }
+    }
 
     registry.init();
 }

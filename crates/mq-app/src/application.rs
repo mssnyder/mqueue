@@ -436,6 +436,15 @@ fn show_account_setup(window: &MqWindow, pool: &Arc<SqlitePool>) {
                         .await
                         .map_err(|e| format!("{e}"))?;
 
+                // Store tokens in keyring
+                mq_core::keyring::store_tokens(
+                    &email,
+                    &tokens.access_token,
+                    tokens.refresh_token.as_deref(),
+                )
+                .await
+                .map_err(|e| format!("Failed to store tokens: {e}"))?;
+
                 // Save to DB
                 let account_id = mq_db::queries::accounts::insert_account(
                     &pool,
@@ -447,9 +456,11 @@ fn show_account_setup(window: &MqWindow, pool: &Arc<SqlitePool>) {
 
                 info!(account_id, %email, "Account added successfully");
 
-                // TODO: Store refresh_token in keyring (Phase 6)
-                if tokens.refresh_token.is_some() {
-                    debug!("Refresh token obtained (keyring storage deferred)");
+                // Run initial IMAP sync for INBOX
+                info!(%email, "Starting initial IMAP sync");
+                match sync_account_mailbox(&pool, account_id, &email, &tokens.access_token, "INBOX").await {
+                    Ok(count) => info!(account_id, count, "Initial sync complete"),
+                    Err(e) => warn!(account_id, error = %e, "Initial sync failed (will retry)"),
                 }
 
                 Ok((email, pool))
@@ -458,20 +469,38 @@ fn show_account_setup(window: &MqWindow, pool: &Arc<SqlitePool>) {
                 Ok((email, pool)) => {
                     dialog.show_success(&email);
 
-                    // Refresh sidebar account list
+                    // Fully re-initialize the UI with the new account data
                     let window2 = window.clone();
                     runtime::spawn_async(
                         async move {
-                            mq_db::queries::accounts::get_all_accounts(&pool)
+                            let accounts = mq_db::queries::accounts::get_all_accounts(&pool)
                                 .await
-                                .unwrap_or_default()
-                        },
-                        move |db_accounts| {
-                            let tuples: Vec<(i64, String, Option<String>)> = db_accounts
+                                .unwrap_or_default();
+                            let account_infos: Vec<AccountInfo> = accounts
                                 .iter()
-                                .map(|a| (a.id, a.email.clone(), a.display_name.clone()))
+                                .map(|a| AccountInfo {
+                                    id: a.id,
+                                    email: a.email.clone(),
+                                    display_name: a.display_name.clone(),
+                                })
                                 .collect();
-                            window2.sidebar().set_accounts(&tuples);
+                            let account_emails: HashMap<i64, String> =
+                                accounts.iter().map(|a| (a.id, a.email.clone())).collect();
+                            let messages =
+                                mq_db::queries::messages::get_messages_all_accounts_for_mailbox(
+                                    &pool, "INBOX", 200, 0,
+                                )
+                                .await
+                                .unwrap_or_default();
+                            AppData {
+                                accounts: account_infos,
+                                messages: db_to_message_data(messages),
+                                account_emails,
+                                pool: Arc::new((*pool).clone()),
+                            }
+                        },
+                        move |data: AppData| {
+                            setup_ui(window2, data);
                         },
                     );
                 }
@@ -482,6 +511,179 @@ fn show_account_setup(window: &MqWindow, pool: &Arc<SqlitePool>) {
             },
         );
     });
+}
+
+/// Sync a single mailbox for an account, persisting results to DB.
+async fn sync_account_mailbox(
+    pool: &SqlitePool,
+    account_id: i64,
+    email: &str,
+    access_token: &str,
+    mailbox: &str,
+) -> std::result::Result<usize, String> {
+    use mq_core::imap::client::ImapSession;
+    use mq_core::imap::sync;
+
+    // Connect to IMAP
+    let mut session = ImapSession::connect(email, access_token)
+        .await
+        .map_err(|e| format!("IMAP connect failed: {e}"))?;
+
+    // Load previous sync state
+    let db_state = mq_db::queries::sync_state::get_sync_state(pool, account_id, mailbox)
+        .await
+        .ok()
+        .flatten();
+
+    let prev_state = db_state.as_ref().map(|s| sync::SyncState {
+        mailbox: s.mailbox.clone(),
+        uid_validity: s.uid_validity as u32,
+        highest_modseq: s.highest_modseq as u64,
+        highest_uid: s.highest_uid as u32,
+    });
+
+    // Get known UIDs for expunge detection
+    let known_uids: Vec<u32> = if prev_state.is_some() {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT uid FROM messages WHERE account_id = ? AND mailbox = ?",
+        )
+        .bind(account_id)
+        .bind(mailbox)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|u| u as u32)
+        .collect()
+    } else {
+        vec![]
+    };
+
+    // Run sync
+    let outcome = sync::sync_mailbox(&mut session, mailbox, prev_state.as_ref(), &known_uids)
+        .await
+        .map_err(|e| format!("Sync failed: {e}"))?;
+
+    let new_count = outcome.new_messages.len();
+
+    // Persist new messages to DB
+    for email_msg in &outcome.new_messages {
+        let flags = flags_to_string(&email_msg.flags);
+        let from = email_msg.from.as_ref();
+        let sender_name = from.and_then(|a| a.name.as_deref());
+        let sender_email = from.map(|a| a.email.as_str()).unwrap_or("unknown@unknown");
+        let recipient_to: String = email_msg
+            .to
+            .iter()
+            .map(|a| {
+                a.name
+                    .as_ref()
+                    .map(|n| format!("{n} <{}>", a.email))
+                    .unwrap_or_else(|| a.email.clone())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let recipient_cc: Option<String> = if email_msg.cc.is_empty() {
+            None
+        } else {
+            Some(
+                email_msg
+                    .cc
+                    .iter()
+                    .map(|a| a.email.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        };
+        let refs_json = if email_msg.references.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&email_msg.references).ok()
+        };
+
+        let _ = mq_db::queries::messages::upsert_message(
+            pool,
+            account_id,
+            email_msg.uid as i64,
+            mailbox,
+            email_msg.gmail_msg_id.map(|v| v as i64),
+            email_msg.gmail_thread_id.map(|v| v as i64),
+            email_msg.message_id.as_deref(),
+            email_msg.in_reply_to.as_deref(),
+            refs_json.as_deref(),
+            sender_name,
+            sender_email,
+            &recipient_to,
+            recipient_cc.as_deref(),
+            email_msg.subject.as_deref(),
+            email_msg.snippet.as_deref(),
+            email_msg.date.as_deref().unwrap_or(""),
+            &flags,
+            email_msg.has_attachments,
+            None, // body_structure
+            email_msg.list_unsubscribe.as_deref(),
+            email_msg.list_unsubscribe_post.as_deref(),
+            None, // modseq per-message not tracked; we use sync_state
+            outcome.new_state.uid_validity as i64,
+        )
+        .await;
+    }
+
+    // Apply flag updates
+    for update in &outcome.flag_updates {
+        let flags = flags_to_string(&update.flags);
+        if let Ok(Some(msg)) =
+            mq_db::queries::messages::get_message_by_uid(pool, account_id, mailbox, update.uid as i64).await
+        {
+            let _ = mq_db::queries::messages::update_flags(pool, msg.id, &flags).await;
+        }
+    }
+
+    // Remove expunged messages
+    for uid in &outcome.expunged_uids {
+        if let Ok(Some(msg)) =
+            mq_db::queries::messages::get_message_by_uid(pool, account_id, mailbox, *uid as i64).await
+        {
+            let _ = mq_db::queries::messages::delete_message(pool, msg.id).await;
+        }
+    }
+
+    // Save sync state
+    let _ = mq_db::queries::sync_state::upsert_sync_state(
+        pool,
+        account_id,
+        mailbox,
+        outcome.new_state.uid_validity as i64,
+        outcome.new_state.highest_modseq as i64,
+        outcome.new_state.highest_uid as i64,
+    )
+    .await;
+
+    // Logout cleanly
+    let _ = session.logout().await;
+
+    Ok(new_count)
+}
+
+/// Convert MessageFlags to a space-separated IMAP flag string.
+fn flags_to_string(flags: &mq_core::email::MessageFlags) -> String {
+    let mut parts = Vec::new();
+    if flags.seen {
+        parts.push("\\Seen");
+    }
+    if flags.flagged {
+        parts.push("\\Flagged");
+    }
+    if flags.answered {
+        parts.push("\\Answered");
+    }
+    if flags.deleted {
+        parts.push("\\Deleted");
+    }
+    if flags.draft {
+        parts.push("\\Draft");
+    }
+    parts.join(" ")
 }
 
 // ---------------------------------------------------------------------------

@@ -1889,6 +1889,7 @@ dependencies = [
  "mq-db",
  "mq-net",
  "serde",
+ "serde_json",
  "sqlx",
  "tokio",
  "tracing",

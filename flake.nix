@@ -56,6 +56,7 @@
             || (builtins.match ".*\\.metainfo\\.xml$" path != null)
             || (builtins.match ".*\\.svg$" path != null)
             || (builtins.match ".*\\.css$" path != null)
+            || (builtins.match ".*\\.sql$" path != null)
             || (builtins.match ".*/data/.*" path != null);
         };
 

@@ -148,7 +148,7 @@ in
           description = "Default email signature.";
         };
         replyPosition = mkOption {
-          type = types.enum' [ "above" "below" ];
+          type = types.enum [ "above" "below" ];
           default = "above";
           description = "Where to place the cursor when replying (above or below quoted text).";
         };
@@ -171,7 +171,7 @@ in
           description = "Enable logging to the systemd journal.";
         };
         level = mkOption {
-          type = types.enum' [ "error" "warn" "info" "debug" "trace" ];
+          type = types.enum [ "error" "warn" "info" "debug" "trace" ];
           default = "info";
           description = "Log level filter.";
         };
@@ -187,7 +187,7 @@ in
 
       appearance = {
         theme = mkOption {
-          type = types.enum' [ "system" "light" "dark" ];
+          type = types.enum [ "system" "light" "dark" ];
           default = "system";
           description = "UI theme preference.";
         };

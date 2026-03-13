@@ -17,6 +17,7 @@ tracing-journald = { workspace = true }
 tracing-appender = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 

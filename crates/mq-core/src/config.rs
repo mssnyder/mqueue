@@ -193,14 +193,31 @@ impl AppConfig {
             .join("mq-mail")
     }
 
+    /// Returns the path to the user preferences file (separate from Nix config).
+    pub fn preferences_path() -> PathBuf {
+        Self::config_dir().join("preferences.toml")
+    }
+
     /// Load config from the standard config path, falling back to defaults.
+    ///
+    /// Loads the base config.toml first (may be a Nix-managed symlink),
+    /// then merges any user-set preferences from preferences.toml on top.
     pub fn load() -> Result<Self> {
         let path = Self::config_path();
-        if path.exists() {
-            Self::load_from(&path)
+        let mut config = if path.exists() {
+            Self::load_from(&path)?
         } else {
-            Ok(Self::default())
+            Self::default()
+        };
+
+        // Merge user preferences on top (these override Nix-managed values)
+        let prefs_path = Self::preferences_path();
+        if prefs_path.exists() {
+            let prefs = Self::load_from(&prefs_path)?;
+            config.merge_preferences(&prefs);
         }
+
+        Ok(config)
     }
 
     /// Load config from a specific file path.
@@ -217,9 +234,11 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// Save the current config to the standard config path.
+    /// Save user preferences to a separate file (never overwrites Nix config).
+    ///
+    /// Only saves non-OAuth settings since OAuth is managed by Nix/sops.
     pub fn save(&self) -> Result<()> {
-        let path = Self::config_path();
+        let path = Self::preferences_path();
         let dir = Self::config_dir();
         fs::create_dir_all(&dir).map_err(|e| {
             MqError::Config(format!(
@@ -227,15 +246,36 @@ impl AppConfig {
                 dir.display()
             ))
         })?;
-        let contents = toml::to_string_pretty(self)
+
+        // Save without OAuth secrets (those stay in Nix config)
+        let prefs = AppConfig {
+            oauth: OAuthConfig::default(),
+            privacy: self.privacy.clone(),
+            compose: self.compose.clone(),
+            logging: self.logging.clone(),
+            cache: self.cache.clone(),
+            appearance: self.appearance.clone(),
+        };
+
+        let contents = toml::to_string_pretty(&prefs)
             .map_err(|e| MqError::Config(format!("Failed to serialize config: {e}")))?;
         fs::write(&path, contents).map_err(|e| {
             MqError::Config(format!(
-                "Failed to write config file {}: {e}",
+                "Failed to write preferences file {}: {e}",
                 path.display()
             ))
         })?;
         Ok(())
+    }
+
+    /// Merge preference values from another config on top of this one.
+    /// OAuth settings are preserved from the base config.
+    fn merge_preferences(&mut self, prefs: &AppConfig) {
+        self.privacy = prefs.privacy.clone();
+        self.compose = prefs.compose.clone();
+        self.logging = prefs.logging.clone();
+        self.cache = prefs.cache.clone();
+        self.appearance = prefs.appearance.clone();
     }
 
     /// Resolve the OAuth client ID, checking file-based sources first.
