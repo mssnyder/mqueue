@@ -168,7 +168,35 @@ fn setup_data(window: &MqWindow) {
             })
         },
         move |result: Result<AppData, String>| match result {
-            Ok(data) => setup_ui(window_clone, data),
+            Ok(data) => {
+                let accounts = data.accounts.clone();
+                let pool = data.pool.clone();
+                let window = window_clone.clone();
+                setup_ui(window_clone, data);
+
+                // Trigger background sync for each existing account
+                for account in &accounts {
+                    let email = account.email.clone();
+                    let account_id = account.id;
+                    let pool = pool.clone();
+                    let window = window.clone();
+
+                    runtime::spawn_async(
+                        async move {
+                            mq_core::keyring::get_tokens(&email).await.ok().flatten()
+                                .map(|t| (t.access_token, email))
+                        },
+                        move |tokens: Option<(String, String)>| {
+                            if let Some((access_token, email)) = tokens {
+                                info!(email = %email, "Starting background sync for existing account");
+                                start_background_sync(window, pool, account_id, email, access_token);
+                            } else {
+                                warn!(account_id, "No tokens in keyring — skipping sync");
+                            }
+                        },
+                    );
+                }
+            }
             Err(e) => {
                 error!("Failed to load data: {e}");
                 window_clone.show_banner(&format!("Error: {e}"));
@@ -323,6 +351,69 @@ fn setup_ui(window: MqWindow, data: AppData) {
         });
     }
 
+    // Account removal via right-click
+    {
+        let w = window.clone();
+        let p = pool.clone();
+        sidebar.connect_account_remove(move |account_id, email| {
+            let w = w.clone();
+            let p = p.clone();
+            let email = email.clone();
+
+            // Confirmation dialog
+            let dialog = adw::AlertDialog::builder()
+                .heading("Remove Account")
+                .body(format!("Remove {email} and all its cached messages?"))
+                .build();
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("remove", "Remove");
+            dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+
+            let w2 = w.clone();
+            dialog.connect_response(None, move |_dialog, response| {
+                if response != "remove" {
+                    return;
+                }
+                let pool = p.clone();
+                let email = email.clone();
+                let window = w2.clone();
+
+                runtime::spawn_async(
+                    async move {
+                        // Delete from keyring
+                        if let Err(e) = mq_core::keyring::delete_tokens(&email).await {
+                            warn!(error = %e, "Failed to delete keyring tokens");
+                        }
+                        // Delete messages + account from DB
+                        let _ = sqlx::query("DELETE FROM messages WHERE account_id = ?")
+                            .bind(account_id)
+                            .execute(&*pool)
+                            .await;
+                        let _ = sqlx::query("DELETE FROM sync_state WHERE account_id = ?")
+                            .bind(account_id)
+                            .execute(&*pool)
+                            .await;
+                        let _ = sqlx::query("DELETE FROM labels WHERE account_id = ?")
+                            .bind(account_id)
+                            .execute(&*pool)
+                            .await;
+                        let _ = mq_db::queries::accounts::delete_account(&pool, account_id).await;
+                        info!(account_id, email = %email, "Account removed");
+                    },
+                    move |()| {
+                        info!("Refreshing UI after account removal");
+                        // Re-run full data setup to rebuild UI
+                        setup_data(&window);
+                    },
+                );
+            });
+
+            dialog.present(Some(&w));
+        });
+    }
+
     // Load and display labels in sidebar
     {
         let sidebar = window.sidebar();
@@ -389,6 +480,7 @@ fn show_account_setup(window: &MqWindow, pool: &Arc<SqlitePool>) {
         let pool = pool.clone();
         let window = window.clone();
 
+        // Phase 1: OAuth only (quick) — get tokens and save account
         runtime::spawn_async(
             async move {
                 let config = mq_core::config::AppConfig::load().unwrap_or_default();
@@ -456,51 +548,46 @@ fn show_account_setup(window: &MqWindow, pool: &Arc<SqlitePool>) {
 
                 info!(account_id, %email, "Account added successfully");
 
-                // Run initial IMAP sync for INBOX
-                info!(%email, "Starting initial IMAP sync");
-                match sync_account_mailbox(&pool, account_id, &email, &tokens.access_token, "INBOX").await {
-                    Ok(count) => info!(account_id, count, "Initial sync complete"),
-                    Err(e) => warn!(account_id, error = %e, "Initial sync failed (will retry)"),
-                }
-
-                Ok((email, pool))
+                Ok((account_id, email, tokens.access_token, pool))
             },
-            move |result: Result<(String, Arc<SqlitePool>), String>| match result {
-                Ok((email, pool)) => {
+            move |result: Result<(i64, String, String, Arc<SqlitePool>), String>| match result {
+                Ok((account_id, email, access_token, pool)) => {
                     dialog.show_success(&email);
 
-                    // Fully re-initialize the UI with the new account data
+                    // Phase 2: Re-init UI immediately (empty inbox is fine)
                     let window2 = window.clone();
+                    let pool2 = pool.clone();
                     runtime::spawn_async(
-                        async move {
-                            let accounts = mq_db::queries::accounts::get_all_accounts(&pool)
-                                .await
-                                .unwrap_or_default();
-                            let account_infos: Vec<AccountInfo> = accounts
-                                .iter()
-                                .map(|a| AccountInfo {
-                                    id: a.id,
-                                    email: a.email.clone(),
-                                    display_name: a.display_name.clone(),
-                                })
-                                .collect();
-                            let account_emails: HashMap<i64, String> =
-                                accounts.iter().map(|a| (a.id, a.email.clone())).collect();
-                            let messages =
-                                mq_db::queries::messages::get_messages_all_accounts_for_mailbox(
-                                    &pool, "INBOX", 200, 0,
-                                )
-                                .await
-                                .unwrap_or_default();
-                            AppData {
-                                accounts: account_infos,
-                                messages: db_to_message_data(messages),
-                                account_emails,
-                                pool: Arc::new((*pool).clone()),
+                        {
+                            let pool = pool.clone();
+                            async move {
+                                let accounts = mq_db::queries::accounts::get_all_accounts(&pool)
+                                    .await
+                                    .unwrap_or_default();
+                                let account_infos: Vec<AccountInfo> = accounts
+                                    .iter()
+                                    .map(|a| AccountInfo {
+                                        id: a.id,
+                                        email: a.email.clone(),
+                                        display_name: a.display_name.clone(),
+                                    })
+                                    .collect();
+                                let account_emails: HashMap<i64, String> =
+                                    accounts.iter().map(|a| (a.id, a.email.clone())).collect();
+                                AppData {
+                                    accounts: account_infos,
+                                    messages: vec![],
+                                    account_emails,
+                                    pool: Arc::new((*pool).clone()),
+                                }
                             }
                         },
                         move |data: AppData| {
-                            setup_ui(window2, data);
+                            setup_ui(window2.clone(), data);
+
+                            // Phase 3: Background sync with progress banner
+                            window2.show_banner("Syncing inbox\u{2026}");
+                            start_background_sync(window2, pool2, account_id, email, access_token);
                         },
                     );
                 }
@@ -513,156 +600,201 @@ fn show_account_setup(window: &MqWindow, pool: &Arc<SqlitePool>) {
     });
 }
 
-/// Sync a single mailbox for an account, persisting results to DB.
-async fn sync_account_mailbox(
-    pool: &SqlitePool,
+/// Run initial IMAP sync in the background, updating the UI as messages arrive.
+fn start_background_sync(
+    window: MqWindow,
+    pool: Arc<SqlitePool>,
     account_id: i64,
-    email: &str,
-    access_token: &str,
-    mailbox: &str,
-) -> std::result::Result<usize, String> {
-    use mq_core::imap::client::ImapSession;
-    use mq_core::imap::sync;
+    email: String,
+    access_token: String,
+) {
+    let (tx, rx) = async_channel::unbounded::<SyncProgress>();
 
-    // Connect to IMAP
-    let mut session = ImapSession::connect(email, access_token)
-        .await
-        .map_err(|e| format!("IMAP connect failed: {e}"))?;
+    // Background sync task — sends progress updates via channel
+    let bg_pool = pool.clone();
+    runtime::runtime().spawn(async move {
+        let pool = bg_pool;
+        use mq_core::imap::client::ImapSession;
+        use mq_core::imap::sync;
 
-    // Load previous sync state
-    let db_state = mq_db::queries::sync_state::get_sync_state(pool, account_id, mailbox)
-        .await
-        .ok()
-        .flatten();
+        let _ = tx.send(SyncProgress::Status("Connecting to Gmail\u{2026}".into())).await;
 
-    let prev_state = db_state.as_ref().map(|s| sync::SyncState {
-        mailbox: s.mailbox.clone(),
-        uid_validity: s.uid_validity as u32,
-        highest_modseq: s.highest_modseq as u64,
-        highest_uid: s.highest_uid as u32,
-    });
-
-    // Get known UIDs for expunge detection
-    let known_uids: Vec<u32> = if prev_state.is_some() {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT uid FROM messages WHERE account_id = ? AND mailbox = ?",
-        )
-        .bind(account_id)
-        .bind(mailbox)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|u| u as u32)
-        .collect()
-    } else {
-        vec![]
-    };
-
-    // Run sync
-    let outcome = sync::sync_mailbox(&mut session, mailbox, prev_state.as_ref(), &known_uids)
-        .await
-        .map_err(|e| format!("Sync failed: {e}"))?;
-
-    let new_count = outcome.new_messages.len();
-
-    // Persist new messages to DB
-    for email_msg in &outcome.new_messages {
-        let flags = flags_to_string(&email_msg.flags);
-        let from = email_msg.from.as_ref();
-        let sender_name = from.and_then(|a| a.name.as_deref());
-        let sender_email = from.map(|a| a.email.as_str()).unwrap_or("unknown@unknown");
-        let recipient_to: String = email_msg
-            .to
-            .iter()
-            .map(|a| {
-                a.name
-                    .as_ref()
-                    .map(|n| format!("{n} <{}>", a.email))
-                    .unwrap_or_else(|| a.email.clone())
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let recipient_cc: Option<String> = if email_msg.cc.is_empty() {
-            None
-        } else {
-            Some(
-                email_msg
-                    .cc
-                    .iter()
-                    .map(|a| a.email.clone())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )
-        };
-        let refs_json = if email_msg.references.is_empty() {
-            None
-        } else {
-            serde_json::to_string(&email_msg.references).ok()
+        let mut session = match ImapSession::connect(&email, &access_token).await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx.send(SyncProgress::Error(format!("IMAP connect failed: {e}"))).await;
+                return;
+            }
         };
 
-        let _ = mq_db::queries::messages::upsert_message(
-            pool,
+        let _ = tx.send(SyncProgress::Status("Fetching messages\u{2026}".into())).await;
+
+        let outcome = match sync::sync_mailbox(&mut session, "INBOX", None, &[]).await {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = tx.send(SyncProgress::Error(format!("Sync failed: {e}"))).await;
+                return;
+            }
+        };
+
+        let total = outcome.new_messages.len();
+        let _ = tx.send(SyncProgress::Status(format!("Saving {total} messages\u{2026}"))).await;
+
+        // Persist messages to DB in batches, sending progress
+        for (i, email_msg) in outcome.new_messages.iter().enumerate() {
+            persist_email_to_db(&pool, account_id, "INBOX", email_msg, &outcome.new_state).await;
+
+            // Send progress every 25 messages
+            if (i + 1) % 25 == 0 || i + 1 == total {
+                let _ = tx.send(SyncProgress::Count(i + 1, total)).await;
+            }
+        }
+
+        // Save sync state
+        let _ = mq_db::queries::sync_state::upsert_sync_state(
+            &pool,
             account_id,
-            email_msg.uid as i64,
-            mailbox,
-            email_msg.gmail_msg_id.map(|v| v as i64),
-            email_msg.gmail_thread_id.map(|v| v as i64),
-            email_msg.message_id.as_deref(),
-            email_msg.in_reply_to.as_deref(),
-            refs_json.as_deref(),
-            sender_name,
-            sender_email,
-            &recipient_to,
-            recipient_cc.as_deref(),
-            email_msg.subject.as_deref(),
-            email_msg.snippet.as_deref(),
-            email_msg.date.as_deref().unwrap_or(""),
-            &flags,
-            email_msg.has_attachments,
-            None, // body_structure
-            email_msg.list_unsubscribe.as_deref(),
-            email_msg.list_unsubscribe_post.as_deref(),
-            None, // modseq per-message not tracked; we use sync_state
+            "INBOX",
             outcome.new_state.uid_validity as i64,
+            outcome.new_state.highest_modseq as i64,
+            outcome.new_state.highest_uid as i64,
         )
         .await;
-    }
 
-    // Apply flag updates
-    for update in &outcome.flag_updates {
-        let flags = flags_to_string(&update.flags);
-        if let Ok(Some(msg)) =
-            mq_db::queries::messages::get_message_by_uid(pool, account_id, mailbox, update.uid as i64).await
-        {
-            let _ = mq_db::queries::messages::update_flags(pool, msg.id, &flags).await;
+        let _ = session.logout().await;
+        let _ = tx.send(SyncProgress::Done(total)).await;
+    });
+
+    // UI-side: receive progress updates on the GTK main thread
+    let w = window.clone();
+    let p = pool;
+    glib::spawn_future_local(async move {
+        while let Ok(progress) = rx.recv().await {
+            match progress {
+                SyncProgress::Status(msg) => {
+                    w.show_banner(&msg);
+                }
+                SyncProgress::Count(done, total) => {
+                    w.show_banner(&format!("Syncing inbox\u{2026} {done}/{total} messages"));
+                    refresh_message_list_from_db(&w, &p);
+                }
+                SyncProgress::Error(msg) => {
+                    error!("Background sync error: {msg}");
+                    w.show_banner(&format!("Sync error: {msg}"));
+                    let w2 = w.clone();
+                    glib::timeout_add_local_once(std::time::Duration::from_secs(5), move || {
+                        w2.hide_banner();
+                    });
+                    break;
+                }
+                SyncProgress::Done(total) => {
+                    info!(total, "Background sync complete");
+                    w.hide_banner();
+                    refresh_message_list_from_db(&w, &p);
+                    break;
+                }
+            }
         }
-    }
+    });
+}
 
-    // Remove expunged messages
-    for uid in &outcome.expunged_uids {
-        if let Ok(Some(msg)) =
-            mq_db::queries::messages::get_message_by_uid(pool, account_id, mailbox, *uid as i64).await
-        {
-            let _ = mq_db::queries::messages::delete_message(pool, msg.id).await;
-        }
-    }
+enum SyncProgress {
+    Status(String),
+    Count(usize, usize),
+    Error(String),
+    Done(usize),
+}
 
-    // Save sync state
-    let _ = mq_db::queries::sync_state::upsert_sync_state(
+/// Quick refresh of the message list from DB (called during/after sync).
+fn refresh_message_list_from_db(window: &MqWindow, pool: &Arc<SqlitePool>) {
+    let ml = window.message_list();
+    let pool = pool.clone();
+    // We need account_emails for badge display but for a quick refresh
+    // we just reload without badges.
+    runtime::spawn_async(
+        async move {
+            mq_db::queries::messages::get_messages_all_accounts_for_mailbox(
+                &pool, "INBOX", 200, 0,
+            )
+            .await
+            .unwrap_or_default()
+        },
+        move |messages: Vec<mq_db::models::DbMessage>| {
+            let data = db_to_message_data(messages);
+            let empty_emails = HashMap::new();
+            let objects = make_message_objects(&data, &empty_emails, false);
+            ml.set_messages(objects);
+        },
+    );
+}
+
+/// Persist a single email from sync to the database.
+async fn persist_email_to_db(
+    pool: &SqlitePool,
+    account_id: i64,
+    mailbox: &str,
+    email_msg: &mq_core::email::Email,
+    new_state: &mq_core::imap::sync::SyncState,
+) {
+    let flags = flags_to_string(&email_msg.flags);
+    let from = email_msg.from.as_ref();
+    let sender_name = from.and_then(|a| a.name.as_deref());
+    let sender_email = from.map(|a| a.email.as_str()).unwrap_or("unknown@unknown");
+    let recipient_to: String = email_msg
+        .to
+        .iter()
+        .map(|a| {
+            a.name
+                .as_ref()
+                .map(|n| format!("{n} <{}>", a.email))
+                .unwrap_or_else(|| a.email.clone())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let recipient_cc: Option<String> = if email_msg.cc.is_empty() {
+        None
+    } else {
+        Some(
+            email_msg
+                .cc
+                .iter()
+                .map(|a| a.email.clone())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    };
+    let refs_json = if email_msg.references.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&email_msg.references).ok()
+    };
+
+    let _ = mq_db::queries::messages::upsert_message(
         pool,
         account_id,
+        email_msg.uid as i64,
         mailbox,
-        outcome.new_state.uid_validity as i64,
-        outcome.new_state.highest_modseq as i64,
-        outcome.new_state.highest_uid as i64,
+        email_msg.gmail_msg_id.map(|v| v as i64),
+        email_msg.gmail_thread_id.map(|v| v as i64),
+        email_msg.message_id.as_deref(),
+        email_msg.in_reply_to.as_deref(),
+        refs_json.as_deref(),
+        sender_name,
+        sender_email,
+        &recipient_to,
+        recipient_cc.as_deref(),
+        email_msg.subject.as_deref(),
+        email_msg.snippet.as_deref(),
+        email_msg.date.as_deref().unwrap_or(""),
+        &flags,
+        email_msg.has_attachments,
+        None,
+        email_msg.list_unsubscribe.as_deref(),
+        email_msg.list_unsubscribe_post.as_deref(),
+        None,
+        new_state.uid_validity as i64,
     )
     .await;
-
-    // Logout cleanly
-    let _ = session.logout().await;
-
-    Ok(new_count)
 }
 
 /// Convert MessageFlags to a space-separated IMAP flag string.

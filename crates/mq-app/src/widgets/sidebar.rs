@@ -2,7 +2,7 @@
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use gtk::glib;
+use gtk::{gio, glib};
 use std::cell::RefCell;
 
 mod imp {
@@ -340,6 +340,61 @@ impl MqSidebar {
     pub fn connect_add_account<F: Fn() + 'static>(&self, f: F) {
         if let Some(btn) = self.imp().add_account_button.borrow().as_ref() {
             btn.connect_clicked(move |_| f());
+        }
+    }
+
+    /// Connect a callback for when an account is requested to be removed.
+    ///
+    /// The callback receives (account_id, email). A right-click context menu
+    /// with "Remove Account" is shown on each account row (except "All Accounts").
+    pub fn connect_account_remove<F: Fn(i64, String) + Clone + 'static>(&self, f: F) {
+        let imp = self.imp();
+        if let Some(list_box) = imp.account_list.borrow().as_ref() {
+            // Attach right-click gesture to the list box
+            let cb = f.clone();
+            let gesture = gtk::GestureClick::new();
+            gesture.set_button(3); // right click
+            gesture.connect_pressed(glib::clone!(
+                #[weak]
+                list_box,
+                move |_gesture, _n_press, x, y| {
+                    // Find which row was clicked
+                    if let Some(row) = list_box.row_at_y(y as i32) {
+                        let name = row.widget_name();
+                        if name == "all" {
+                            return; // Can't remove "All Accounts"
+                        }
+                        let Some(account_id) = name.parse::<i64>().ok() else {
+                            return;
+                        };
+                        let email = row.tooltip_text().map(|s| s.to_string()).unwrap_or_default();
+
+                        // Build popover menu
+                        let menu = gio::Menu::new();
+                        menu.append(Some("Remove Account"), Some("sidebar.remove-account"));
+
+                        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+                        popover.set_parent(&row);
+                        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+                            x as i32, y as i32 - row.allocation().y(), 1, 1,
+                        )));
+                        popover.set_has_arrow(true);
+
+                        // Register the action on the row
+                        let action_group = gio::SimpleActionGroup::new();
+                        let cb = cb.clone();
+                        let remove_action = gio::SimpleAction::new("remove-account", None);
+                        remove_action.connect_activate(move |_, _| {
+                            cb(account_id, email.clone());
+                        });
+                        action_group.add_action(&remove_action);
+                        row.insert_action_group("sidebar", Some(&action_group));
+
+                        popover.popup();
+                    }
+                }
+            ));
+            list_box.add_controller(gesture);
         }
     }
 
