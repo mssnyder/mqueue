@@ -16,9 +16,9 @@ toml = { workspace = true }
 url = { workspace = true }
 
 # IMAP
-async-imap = "0.11"
-async-native-tls = "0.5"
-tokio-util = { version = "0.7", features = ["compat"] }
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+tokio-native-tls = "0.3"
+native-tls = "0.2"
 futures = "0.3"
 base64 = "0.22"
 
@@ -27,6 +27,7 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1-rustl
 
 # Email parsing
 mail-parser = "0.9"
+encoding_rs = "0.8"
 
 # OAuth2
 oauth2 = "5"
@@ -34,6 +35,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 # Secrets (GNOME Keyring / Flatpak Secrets portal)
 oo7 = "0.3"
+
+# Date parsing
+chrono = "0.4"
 
 # XDG directories
 dirs = "6"

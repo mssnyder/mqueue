@@ -3,14 +3,13 @@
 //! Sends email through smtp.gmail.com:587 (STARTTLS).
 
 use lettre::message::header::ContentType;
-use lettre::message::{Mailbox, MessageBuilder, MultiPart, SinglePart};
+use lettre::message::{Attachment, Mailbox, MessageBuilder, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use tracing::{debug, info};
 
 use crate::error::{MqError, Result};
-use crate::oauth;
 
 /// Parameters for composing and sending an email.
 #[derive(Debug, Clone)]
@@ -25,21 +24,22 @@ pub struct OutgoingEmail {
     pub body_html: Option<String>,
     pub in_reply_to: Option<String>,
     pub references: Option<String>,
+    /// Attachments: (filename, mime_type, content bytes).
+    pub attachments: Vec<(String, String, Vec<u8>)>,
 }
 
 /// Send an email via Gmail SMTP with XOAUTH2 authentication.
 pub async fn send_email(email: &OutgoingEmail, access_token: &str) -> Result<()> {
-    let xoauth2 = oauth::xoauth2_string(&email.from_email, access_token);
-
     let tls_params = TlsParameters::new("smtp.gmail.com".to_string())
         .map_err(|e| MqError::Other(anyhow::anyhow!("TLS setup error: {e}")))?;
 
+    // Lettre constructs the XOAUTH2 SASL string internally from (username, access_token)
     let transport: AsyncSmtpTransport<Tokio1Executor> =
         AsyncSmtpTransport::<Tokio1Executor>::starttls_relay("smtp.gmail.com")
             .map_err(|e| MqError::Other(anyhow::anyhow!("SMTP relay error: {e}")))?
             .port(587)
             .tls(Tls::Required(tls_params))
-            .credentials(Credentials::new(email.from_email.clone(), xoauth2))
+            .credentials(Credentials::new(email.from_email.clone(), access_token.to_string()))
             .authentication(vec![Mechanism::Xoauth2])
             .build();
 
@@ -95,23 +95,48 @@ fn build_message(email: &OutgoingEmail) -> Result<Message> {
         builder = builder.references(refs.clone());
     }
 
-    let message = if let Some(ref html) = email.body_html {
-        builder
-            .multipart(
-                MultiPart::alternative()
-                    .singlepart(
-                        SinglePart::builder()
-                            .header(ContentType::TEXT_PLAIN)
-                            .body(email.body_text.clone()),
-                    )
-                    .singlepart(
-                        SinglePart::builder()
-                            .header(ContentType::TEXT_HTML)
-                            .body(html.clone()),
-                    ),
+    let has_attachments = !email.attachments.is_empty();
+
+    // Build the text/html body part(s)
+    let body_part = if let Some(ref html) = email.body_html {
+        MultiPart::alternative()
+            .singlepart(
+                SinglePart::builder()
+                    .header(ContentType::TEXT_PLAIN)
+                    .body(email.body_text.clone()),
             )
+            .singlepart(
+                SinglePart::builder()
+                    .header(ContentType::TEXT_HTML)
+                    .body(html.clone()),
+            )
+    } else {
+        MultiPart::alternative().singlepart(
+            SinglePart::builder()
+                .header(ContentType::TEXT_PLAIN)
+                .body(email.body_text.clone()),
+        )
+    };
+
+    let message = if has_attachments {
+        // mixed: body + attachments
+        let mut mixed = MultiPart::mixed().multipart(body_part);
+        for (filename, mime_type, data) in &email.attachments {
+            let ct = mime_type
+                .parse::<ContentType>()
+                .unwrap_or(ContentType::parse("application/octet-stream").unwrap());
+            let attachment = Attachment::new(filename.clone()).body(data.clone(), ct);
+            mixed = mixed.singlepart(attachment);
+        }
+        builder
+            .multipart(mixed)
+            .map_err(|e| MqError::Other(anyhow::anyhow!("Failed to build message: {e}")))?
+    } else if email.body_html.is_some() {
+        builder
+            .multipart(body_part)
             .map_err(|e| MqError::Other(anyhow::anyhow!("Failed to build message: {e}")))?
     } else {
+        // Simple plain text with no attachments
         builder
             .body(email.body_text.clone())
             .map_err(|e| MqError::Other(anyhow::anyhow!("Failed to build message: {e}")))?

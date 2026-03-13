@@ -97,6 +97,17 @@ pub struct DbOfflineOp {
     pub error_msg: Option<String>,
 }
 
+/// Database row for a contact (synced from Google People API).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DbContact {
+    pub id: i64,
+    pub account_id: i64,
+    pub resource_id: Option<String>,
+    pub display_name: Option<String>,
+    pub email: String,
+    pub synced_at: String,
+}
+
 /// Database row for sync state per mailbox.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DbSyncState {

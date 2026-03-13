@@ -19,6 +19,7 @@ pub struct AppConfig {
     pub logging: LoggingConfig,
     pub cache: CacheConfig,
     pub appearance: AppearanceConfig,
+    pub sync: SyncConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +71,26 @@ pub struct CacheConfig {
 #[serde(default)]
 pub struct AppearanceConfig {
     pub theme: Theme,
+    pub time_format: TimeFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TimeFormat {
+    /// 12-hour with AM/PM (e.g. "03/13/2026 7:17 PM")
+    #[serde(rename = "12h")]
+    TwelveHour,
+    /// 24-hour (e.g. "2026-03-13 19:17")
+    #[serde(rename = "24h")]
+    TwentyFourHour,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncConfig {
+    /// When true, sync all Gmail mailboxes (Starred, Sent, Drafts, etc.)
+    /// instead of just INBOX. Disabled by default.
+    pub sync_all_mailboxes: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +119,7 @@ impl Default for AppConfig {
             logging: LoggingConfig::default(),
             cache: CacheConfig::default(),
             appearance: AppearanceConfig::default(),
+            sync: SyncConfig::default(),
         }
     }
 }
@@ -155,6 +177,21 @@ impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
             theme: Theme::System,
+            time_format: TimeFormat::TwelveHour,
+        }
+    }
+}
+
+impl Default for TimeFormat {
+    fn default() -> Self {
+        Self::TwelveHour
+    }
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            sync_all_mailboxes: false,
         }
     }
 }
@@ -193,31 +230,14 @@ impl AppConfig {
             .join("mq-mail")
     }
 
-    /// Returns the path to the user preferences file (separate from Nix config).
-    pub fn preferences_path() -> PathBuf {
-        Self::config_dir().join("preferences.toml")
-    }
-
     /// Load config from the standard config path, falling back to defaults.
-    ///
-    /// Loads the base config.toml first (may be a Nix-managed symlink),
-    /// then merges any user-set preferences from preferences.toml on top.
     pub fn load() -> Result<Self> {
         let path = Self::config_path();
-        let mut config = if path.exists() {
-            Self::load_from(&path)?
+        if path.exists() {
+            Self::load_from(&path)
         } else {
-            Self::default()
-        };
-
-        // Merge user preferences on top (these override Nix-managed values)
-        let prefs_path = Self::preferences_path();
-        if prefs_path.exists() {
-            let prefs = Self::load_from(&prefs_path)?;
-            config.merge_preferences(&prefs);
+            Ok(Self::default())
         }
-
-        Ok(config)
     }
 
     /// Load config from a specific file path.
@@ -234,11 +254,16 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// Save user preferences to a separate file (never overwrites Nix config).
+    /// Save config to `config.toml`.
     ///
-    /// Only saves non-OAuth settings since OAuth is managed by Nix/sops.
+    /// This is a no-op when the config is Nix-managed (read-only symlink).
+    /// Non-Nix users get their settings saved directly to config.toml.
     pub fn save(&self) -> Result<()> {
-        let path = Self::preferences_path();
+        if Self::is_nix_managed() {
+            return Ok(());
+        }
+
+        let path = Self::config_path();
         let dir = Self::config_dir();
         fs::create_dir_all(&dir).map_err(|e| {
             MqError::Config(format!(
@@ -247,35 +272,15 @@ impl AppConfig {
             ))
         })?;
 
-        // Save without OAuth secrets (those stay in Nix config)
-        let prefs = AppConfig {
-            oauth: OAuthConfig::default(),
-            privacy: self.privacy.clone(),
-            compose: self.compose.clone(),
-            logging: self.logging.clone(),
-            cache: self.cache.clone(),
-            appearance: self.appearance.clone(),
-        };
-
-        let contents = toml::to_string_pretty(&prefs)
+        let contents = toml::to_string_pretty(self)
             .map_err(|e| MqError::Config(format!("Failed to serialize config: {e}")))?;
         fs::write(&path, contents).map_err(|e| {
             MqError::Config(format!(
-                "Failed to write preferences file {}: {e}",
+                "Failed to write config file {}: {e}",
                 path.display()
             ))
         })?;
         Ok(())
-    }
-
-    /// Merge preference values from another config on top of this one.
-    /// OAuth settings are preserved from the base config.
-    fn merge_preferences(&mut self, prefs: &AppConfig) {
-        self.privacy = prefs.privacy.clone();
-        self.compose = prefs.compose.clone();
-        self.logging = prefs.logging.clone();
-        self.cache = prefs.cache.clone();
-        self.appearance = prefs.appearance.clone();
     }
 
     /// Resolve the OAuth client ID, checking file-based sources first.
@@ -290,6 +295,19 @@ impl AppConfig {
             &self.oauth.client_secret,
             "client_secret",
         )
+    }
+
+    /// Check if the config.toml is Nix-managed (i.e., a symlink into /nix/store).
+    /// When true, the preferences UI should show settings as read-only and direct
+    /// the user to change values in their Nix configuration.
+    pub fn is_nix_managed() -> bool {
+        let path = Self::config_path();
+        if let Ok(target) = std::fs::read_link(&path) {
+            let target_str = target.to_string_lossy();
+            target_str.contains("/nix/store/")
+        } else {
+            false
+        }
     }
 
     /// Resolve a secret value: file path takes precedence over inline value.

@@ -32,6 +32,9 @@ mod imp {
 
         // Cache
         pub retention_row: RefCell<Option<adw::SpinRow>>,
+
+        // Sync
+        pub sync_all_row: RefCell<Option<adw::SwitchRow>>,
     }
 
     #[glib::object_subclass]
@@ -167,18 +170,56 @@ mod imp {
             cache_group.add(&retention_row);
 
             advanced_page.add(&cache_group);
+
+            let sync_group = adw::PreferencesGroup::builder()
+                .title("Sync")
+                .build();
+
+            let sync_all_row = adw::SwitchRow::builder()
+                .title("Sync all mailboxes")
+                .subtitle("Sync Starred, Sent, Drafts, etc. instead of just Inbox")
+                .build();
+            sync_group.add(&sync_all_row);
+
+            advanced_page.add(&sync_group);
             window.add(&advanced_page);
 
             // Store references
-            *self.theme_row.borrow_mut() = Some(theme_row);
-            *self.block_images_row.borrow_mut() = Some(block_images_row);
-            *self.strip_tracking_row.borrow_mut() = Some(strip_tracking_row);
-            *self.signature_row.borrow_mut() = Some(signature_row);
-            *self.reply_position_row.borrow_mut() = Some(reply_position_row);
-            *self.file_logging_row.borrow_mut() = Some(file_logging_row);
-            *self.journald_row.borrow_mut() = Some(journald_row);
-            *self.log_level_row.borrow_mut() = Some(log_level_row);
-            *self.retention_row.borrow_mut() = Some(retention_row);
+            *self.theme_row.borrow_mut() = Some(theme_row.clone());
+            *self.block_images_row.borrow_mut() = Some(block_images_row.clone());
+            *self.strip_tracking_row.borrow_mut() = Some(strip_tracking_row.clone());
+            *self.signature_row.borrow_mut() = Some(signature_row.clone());
+            *self.reply_position_row.borrow_mut() = Some(reply_position_row.clone());
+            *self.file_logging_row.borrow_mut() = Some(file_logging_row.clone());
+            *self.journald_row.borrow_mut() = Some(journald_row.clone());
+            *self.log_level_row.borrow_mut() = Some(log_level_row.clone());
+            *self.retention_row.borrow_mut() = Some(retention_row.clone());
+            *self.sync_all_row.borrow_mut() = Some(sync_all_row.clone());
+
+            // If config is Nix-managed, grey out all settings with a notice
+            if mq_core::config::AppConfig::is_nix_managed() {
+                // Add a banner to the first page explaining Nix management
+                let nix_group = adw::PreferencesGroup::builder()
+                    .title("Managed by Nix")
+                    .description(
+                        "Settings are managed by your Nix configuration and cannot be changed here. \
+                         Edit your mq-mail module in your NixOS/home-manager config to change these values."
+                    )
+                    .build();
+                appearance_page.add(&nix_group);
+
+                // Grey out all interactive rows
+                theme_row.set_sensitive(false);
+                block_images_row.set_sensitive(false);
+                strip_tracking_row.set_sensitive(false);
+                signature_row.set_sensitive(false);
+                reply_position_row.set_sensitive(false);
+                file_logging_row.set_sensitive(false);
+                journald_row.set_sensitive(false);
+                log_level_row.set_sensitive(false);
+                retention_row.set_sensitive(false);
+                sync_all_row.set_sensitive(false);
+            }
         }
     }
 
@@ -262,6 +303,11 @@ impl MqPreferences {
         if let Some(row) = imp.retention_row.borrow().as_ref() {
             row.set_value(config.cache.retention_days as f64);
         }
+
+        // Sync
+        if let Some(row) = imp.sync_all_row.borrow().as_ref() {
+            row.set_active(config.sync.sync_all_mailboxes);
+        }
     }
 
     /// Read current UI state back into an AppConfig.
@@ -321,6 +367,11 @@ impl MqPreferences {
         // Cache
         if let Some(row) = imp.retention_row.borrow().as_ref() {
             config.cache.retention_days = row.value() as u32;
+        }
+
+        // Sync
+        if let Some(row) = imp.sync_all_row.borrow().as_ref() {
+            config.sync.sync_all_mailboxes = row.is_active();
         }
 
         config

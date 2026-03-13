@@ -1,17 +1,14 @@
 use async_imap::Client as ImapClient;
-use async_native_tls::TlsConnector;
 use futures::TryStreamExt;
 use tokio::net::TcpStream;
-use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{debug, info};
 
 use crate::error::{MqError, Result};
 use crate::oauth;
 
 /// The TLS stream type used for IMAP connections.
-/// tokio TcpStream is wrapped with tokio_util::compat to provide futures_io traits
-/// that async-imap and async-native-tls require.
-pub type ImapTlsStream = async_native_tls::TlsStream<tokio_util::compat::Compat<TcpStream>>;
+/// Uses tokio-native-tls for native tokio AsyncRead/AsyncWrite compatibility.
+pub type ImapTlsStream = tokio_native_tls::TlsStream<TcpStream>;
 
 /// An authenticated IMAP session connected to Gmail.
 pub struct ImapSession {
@@ -26,26 +23,51 @@ impl ImapSession {
 
         debug!(host, port, email, "Connecting to IMAP server");
 
-        let tcp = TcpStream::connect((host, port)).await.map_err(|e| {
-            MqError::Imap(async_imap::error::Error::Io(e))
-        })?;
+        let tcp = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            TcpStream::connect((host, port)),
+        )
+        .await
+        .map_err(|_| MqError::Other(anyhow::anyhow!("IMAP connection timed out after 30s")))?
+        .map_err(|e| MqError::Imap(async_imap::error::Error::Io(e)))?;
 
-        // Wrap tokio TcpStream with compat layer for futures_io traits
-        let tcp_compat = tcp.compat();
+        debug!("TCP connection established, starting TLS handshake");
 
-        let tls = TlsConnector::new();
-        let tls_stream = tls.connect(host, tcp_compat).await.map_err(|e| {
-            MqError::Other(anyhow::anyhow!("TLS handshake failed: {e}"))
-        })?;
+        let tls_connector = native_tls::TlsConnector::new()
+            .map_err(|e| MqError::Other(anyhow::anyhow!("TLS connector creation failed: {e}")))?;
+        let tls_connector = tokio_native_tls::TlsConnector::from(tls_connector);
 
-        let client = ImapClient::new(tls_stream);
+        let tls_stream = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tls_connector.connect(host, tcp),
+        )
+        .await
+        .map_err(|_| MqError::Other(anyhow::anyhow!("TLS handshake timed out after 30s")))?
+        .map_err(|e| MqError::Other(anyhow::anyhow!("TLS handshake failed: {e}")))?;
+
+        debug!("TLS handshake complete, reading server greeting");
+
+        let mut client = ImapClient::new(tls_stream);
+
+        // Must read the server greeting before sending any commands.
+        // The server sends "* OK Gimap ready..." upon connection.
+        let _greeting = client
+            .read_response()
+            .await
+            .map_err(|e| MqError::Other(anyhow::anyhow!("Failed to read IMAP greeting: {e}")))?
+            .ok_or_else(|| MqError::Other(anyhow::anyhow!("IMAP server closed connection before greeting")))?;
+
+        debug!("Server greeting received, authenticating");
 
         let auth_string = oauth::xoauth2_string(email, access_token);
 
-        let session = client
-            .authenticate("XOAUTH2", ImapOAuth2 { auth_string })
-            .await
-            .map_err(|(e, _)| e)?;
+        let session = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.authenticate("XOAUTH2", ImapOAuth2 { auth_string }),
+        )
+        .await
+        .map_err(|_| MqError::Other(anyhow::anyhow!("IMAP authentication timed out after 30s")))?
+        .map_err(|(e, _)| e)?;
 
         info!(email, "IMAP authentication successful");
         Ok(Self { session })
@@ -150,6 +172,83 @@ impl ImapSession {
         Ok(())
     }
 
+    /// Fetch Gmail-specific metadata (X-GM-MSGID, X-GM-THRID, X-GM-LABELS)
+    /// using raw IMAP commands. async-imap's parser doesn't handle Gmail
+    /// extensions, so we parse the raw response bytes ourselves.
+    pub async fn fetch_gmail_metadata_raw(
+        &mut self,
+        uid_range: &str,
+    ) -> Result<Vec<super::gmail_ext::GmailMetadata>> {
+        use std::collections::HashMap;
+
+        let tag = self
+            .session
+            .run_command(format!(
+                "UID FETCH {uid_range} (UID X-GM-MSGID X-GM-THRID X-GM-LABELS)"
+            ))
+            .await?;
+
+        let mut uid_map: HashMap<u32, super::gmail_ext::GmailMetadata> = HashMap::new();
+
+        loop {
+            match self.session.read_response().await {
+                Ok(Some(resp)) => {
+                    let line = format!("{:?}", resp.parsed());
+                    // Check if this is the tagged OK response (end of FETCH)
+                    if line.contains("Done(Ok") || line.contains(&format!("{:?}", tag)) {
+                        break;
+                    }
+                    // Parse untagged FETCH responses from raw Debug output.
+                    // The raw bytes contain lines like:
+                    //   * 5 FETCH (UID 123 X-GM-MSGID 456 X-GM-THRID 789 X-GM-LABELS (...))
+                    // Since imap-proto doesn't parse Gmail extensions, look at
+                    // the raw bytes in the owner field via Debug.
+                    let raw = format!("{:?}", resp);
+                    // Log the first response to help diagnose parsing issues
+                    if uid_map.is_empty() {
+                        tracing::trace!(raw_sample = &raw[..raw.len().min(500)], "First Gmail metadata response");
+                    }
+                    if let Some(uid) = parse_uid_from_raw(&raw) {
+                        let meta = uid_map
+                            .entry(uid)
+                            .or_insert_with(|| super::gmail_ext::GmailMetadata {
+                                uid,
+                                ..Default::default()
+                            });
+                        if let Some(msg_id) = parse_num_attr(&raw, "X-GM-MSGID") {
+                            meta.gmail_msg_id = Some(msg_id);
+                        }
+                        if let Some(thrid) = parse_num_attr(&raw, "X-GM-THRID") {
+                            meta.gmail_thread_id = Some(thrid);
+                        }
+                        let labels = parse_gm_labels_raw(&raw);
+                        if !labels.is_empty() {
+                            meta.labels = labels;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        let with_thrid = uid_map.values().filter(|m| m.gmail_thread_id.is_some()).count();
+        let result: Vec<_> = uid_map.into_values().collect();
+        debug!(
+            count = result.len(),
+            with_thread_ids = with_thrid,
+            uid_range,
+            "Fetched Gmail metadata (raw)"
+        );
+        if with_thrid == 0 && !result.is_empty() {
+            tracing::warn!(
+                "No X-GM-THRID found in Gmail metadata — threading may not work. \
+                 Run with RUST_LOG=trace to see raw response format."
+            );
+        }
+        Ok(result)
+    }
+
     /// Get a mutable reference to the underlying session (for sync/idle extensions).
     pub fn inner_mut(&mut self) -> &mut async_imap::Session<ImapTlsStream> {
         &mut self.session
@@ -190,4 +289,39 @@ impl async_imap::Authenticator for ImapOAuth2 {
     fn process(&mut self, _data: &[u8]) -> Self::Response {
         self.auth_string.clone()
     }
+}
+
+/// Parse UID from raw IMAP response debug output.
+fn parse_uid_from_raw(raw: &str) -> Option<u32> {
+    // Look for "UID " followed by digits in the raw response
+    let marker = "UID ";
+    let idx = raw.find(marker)?;
+    let rest = &raw[idx + marker.len()..];
+    let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    num_str.parse().ok()
+}
+
+/// Parse a numeric attribute (X-GM-MSGID or X-GM-THRID) from raw bytes.
+fn parse_num_attr(raw: &str, attr: &str) -> Option<u64> {
+    let marker = format!("{attr} ");
+    let idx = raw.find(&marker)?;
+    let rest = &raw[idx + marker.len()..];
+    let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    num_str.parse().ok()
+}
+
+/// Parse X-GM-LABELS from raw IMAP response.
+fn parse_gm_labels_raw(raw: &str) -> Vec<String> {
+    let marker = "X-GM-LABELS (";
+    let idx = match raw.find(marker) {
+        Some(i) => i,
+        None => return vec![],
+    };
+    let rest = &raw[idx + marker.len()..];
+    let end = match rest.find(')') {
+        Some(i) => i,
+        None => return vec![],
+    };
+    let label_str = &rest[..end];
+    super::gmail_ext::parse_label_list_pub(label_str)
 }

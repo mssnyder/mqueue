@@ -34,10 +34,14 @@ let
       };
       appearance = {
         theme = cfg.settings.appearance.theme;
+        time_format = cfg.settings.appearance.timeFormat;
       };
       notifications = {
         enabled = cfg.settings.notifications.enabled;
         sound = cfg.settings.notifications.sound;
+      };
+      sync = {
+        sync_all_mailboxes = cfg.settings.sync.allMailboxes;
       };
     }
   ));
@@ -81,10 +85,14 @@ let
       };
       appearance = {
         theme = cfg.settings.appearance.theme;
+        time_format = cfg.settings.appearance.timeFormat;
       };
       notifications = {
         enabled = cfg.settings.notifications.enabled;
         sound = cfg.settings.notifications.sound;
+      };
+      sync = {
+        sync_all_mailboxes = cfg.settings.sync.allMailboxes;
       };
     }
   );
@@ -191,6 +199,11 @@ in
           default = "system";
           description = "UI theme preference.";
         };
+        timeFormat = mkOption {
+          type = types.enum [ "12h" "24h" ];
+          default = "12h";
+          description = "Time display format: 12-hour with AM/PM or 24-hour.";
+        };
       };
 
       notifications = {
@@ -203,6 +216,14 @@ in
           type = types.bool;
           default = false;
           description = "Play a sound on new mail notification.";
+        };
+      };
+
+      sync = {
+        allMailboxes = mkOption {
+          type = types.bool;
+          default = false;
+          description = "Sync all Gmail mailboxes (Starred, Sent, Drafts, etc.) instead of just INBOX.";
         };
       };
     };

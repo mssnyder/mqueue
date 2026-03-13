@@ -80,7 +80,7 @@ mod imp {
 
             // "All Accounts" is the first row (always present)
             let all_row = Self::create_account_row(
-                "mail-inbox-symbolic",
+                "view-list-bullet-symbolic",
                 "All Accounts",
                 "all",
             );
@@ -375,8 +375,9 @@ impl MqSidebar {
 
                         let popover = gtk::PopoverMenu::from_model(Some(&menu));
                         popover.set_parent(&row);
+                        let row_y = row.compute_bounds(&row).map(|b| b.y() as i32).unwrap_or(0);
                         popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
-                            x as i32, y as i32 - row.allocation().y(), 1, 1,
+                            x as i32, y as i32 - row_y, 1, 1,
                         )));
                         popover.set_has_arrow(true);
 

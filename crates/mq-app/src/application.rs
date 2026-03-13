@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 use crate::config;
 use crate::runtime;
 use crate::widgets::account_setup::MqAccountSetup;
-use crate::widgets::compose_window::{ComposeMode, MqComposeWindow};
+use crate::widgets::compose_window::{ComposeMode, ContactEntry, MqComposeWindow};
 use crate::widgets::message_object::MessageObject;
 use crate::widgets::window::MqWindow;
 
@@ -25,11 +25,27 @@ pub fn run() -> i32 {
     app.connect_startup(|_app| {
         info!("Application startup");
 
+        // WORKAROUND: On Wayland, gtk-xft-dpi can be 0, which causes
+        // WebKitGTK's refreshInternalScaling() to compute NaN page zoom
+        // (fontDPI/96 = 0/96 = 0, then 0/0 = NaN), breaking all CSS
+        // box-model rendering. Set to 96 DPI so WebKitGTK computes
+        // zoom = 96/96 = 1.0. The Wayland compositor handles display
+        // scaling separately — do NOT multiply by the scale factor.
+        if let Some(settings) = gtk::Settings::default() {
+            if settings.gtk_xft_dpi() <= 0 {
+                settings.set_gtk_xft_dpi(96 * 1024);
+                info!("Set temporary gtk-xft-dpi=96 (Wayland safety net)");
+            }
+        }
+
         // Register bundled fallback icons as a GResource.
         // These are treated as hicolor fallback — the user's icon theme is
         // always checked first. Only if an icon isn't found anywhere in the
         // theme's inheritance chain do these kick in.
         register_bundled_icons();
+
+        // Set the application icon (used in the window title bar, taskbar, etc.)
+        gtk::Window::set_default_icon_name(config::APP_ID);
 
         load_css();
     });
@@ -98,8 +114,11 @@ struct MessageData {
     mailbox: String,
     account_id: i64,
     recipient_to: String,
+    recipient_cc: Option<String>,
     list_unsubscribe: Option<String>,
     list_unsubscribe_post: Option<String>,
+    gmail_thread_id: Option<i64>,
+    thread_count: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -150,19 +169,19 @@ fn setup_data(window: &MqWindow) {
 
             info!(count = accounts.len(), "Loading unified inbox");
 
-            // Unified inbox: all accounts' INBOX
-            let messages =
-                mq_db::queries::messages::get_messages_all_accounts_for_mailbox(
+            // Unified inbox: threaded view of all accounts' INBOX
+            let threads =
+                mq_db::queries::messages::get_threads_for_mailbox(
                     &pool, "INBOX", 200, 0,
                 )
                 .await
                 .unwrap_or_default();
 
-            info!(count = messages.len(), "Loaded cached messages (unified)");
+            info!(count = threads.len(), "Loaded cached threads (unified)");
 
             Ok(AppData {
                 accounts: account_infos,
-                messages: db_to_message_data(messages),
+                messages: db_to_threaded_message_data(threads),
                 account_emails,
                 pool: Arc::new(pool),
             })
@@ -172,30 +191,14 @@ fn setup_data(window: &MqWindow) {
                 let accounts = data.accounts.clone();
                 let pool = data.pool.clone();
                 let window = window_clone.clone();
-                setup_ui(window_clone, data);
+                let shared_messages = setup_ui(window_clone, data);
 
                 // Trigger background sync for each existing account
-                for account in &accounts {
-                    let email = account.email.clone();
-                    let account_id = account.id;
-                    let pool = pool.clone();
-                    let window = window.clone();
+                trigger_sync_all_accounts(&accounts, &pool, &window, &shared_messages);
 
-                    runtime::spawn_async(
-                        async move {
-                            mq_core::keyring::get_tokens(&email).await.ok().flatten()
-                                .map(|t| (t.access_token, email))
-                        },
-                        move |tokens: Option<(String, String)>| {
-                            if let Some((access_token, email)) = tokens {
-                                info!(email = %email, "Starting background sync for existing account");
-                                start_background_sync(window, pool, account_id, email, access_token);
-                            } else {
-                                warn!(account_id, "No tokens in keyring — skipping sync");
-                            }
-                        },
-                    );
-                }
+                // Register the "resync" action so preferences can trigger a
+                // re-sync when the user toggles sync_all_mailboxes.
+                register_resync_action(&window, &accounts, &pool, &shared_messages);
             }
             Err(e) => {
                 error!("Failed to load data: {e}");
@@ -205,8 +208,127 @@ fn setup_data(window: &MqWindow) {
     );
 }
 
+/// Trigger a background sync for all accounts, refreshing tokens as needed.
+fn trigger_sync_all_accounts(
+    accounts: &[AccountInfo],
+    pool: &Arc<SqlitePool>,
+    window: &MqWindow,
+    shared_messages: &Rc<RefCell<Vec<MessageData>>>,
+) {
+    for account in accounts {
+        let email = account.email.clone();
+        let account_id = account.id;
+        let pool = pool.clone();
+        let window = window.clone();
+        let msgs = shared_messages.clone();
+
+        runtime::spawn_async(
+            async move {
+                let stored = mq_core::keyring::get_tokens(&email).await.ok().flatten();
+                let stored = match stored {
+                    Some(t) => t,
+                    None => return None,
+                };
+
+                let access_token = match mq_core::keyring::refresh_and_store(&email).await {
+                    Ok(new_token) => {
+                        tracing::info!(email = %email, "Refreshed access token for sync");
+                        new_token
+                    }
+                    Err(e) => {
+                        tracing::warn!(email = %email, error = %e, "Token refresh failed, using stored token");
+                        stored.access_token
+                    }
+                };
+
+                Some((access_token, email))
+            },
+            move |tokens: Option<(String, String)>| {
+                if let Some((access_token, email)) = tokens {
+                    info!(email = %email, "Starting background sync");
+                    start_background_sync(window, pool, account_id, email, access_token, msgs);
+                } else {
+                    warn!(account_id, "No tokens in keyring — skipping sync");
+                }
+            },
+        );
+    }
+}
+
+/// Trigger a background sync for a single account (e.g. after send/delete/archive).
+fn trigger_sync_account(
+    account_id: i64,
+    pool: &Arc<SqlitePool>,
+    window: &MqWindow,
+    shared_messages: &Rc<RefCell<Vec<MessageData>>>,
+) {
+    let pool_async = pool.clone();
+    let pool_cb = pool.clone();
+    let window = window.clone();
+    let msgs = shared_messages.clone();
+
+    runtime::spawn_async(
+        async move {
+            let accounts = mq_db::queries::accounts::get_all_accounts(&pool_async)
+                .await
+                .unwrap_or_default();
+            let account = accounts.iter().find(|a| a.id == account_id);
+            let email = match account {
+                Some(a) => a.email.clone(),
+                None => return None,
+            };
+
+            let access_token = match mq_core::keyring::refresh_and_store(&email).await {
+                Ok(t) => t,
+                Err(_) => {
+                    let stored = mq_core::keyring::get_tokens(&email).await.ok().flatten();
+                    match stored {
+                        Some(t) => t.access_token,
+                        None => return None,
+                    }
+                }
+            };
+
+            Some((access_token, email))
+        },
+        move |tokens: Option<(String, String)>| {
+            if let Some((access_token, email)) = tokens {
+                info!(email = %email, "Triggering post-action sync");
+                start_background_sync(window, pool_cb, account_id, email, access_token, msgs);
+            }
+        },
+    );
+}
+
+/// Register the `app.resync` GIO action so the preferences window can
+/// trigger a re-sync when the user toggles sync settings.
+fn register_resync_action(
+    window: &MqWindow,
+    accounts: &[AccountInfo],
+    pool: &Arc<SqlitePool>,
+    shared_messages: &Rc<RefCell<Vec<MessageData>>>,
+) {
+    let Some(app) = window.application() else {
+        return;
+    };
+
+    let accounts = accounts.to_vec();
+    let pool = pool.clone();
+    let window = window.clone();
+    let msgs = shared_messages.clone();
+
+    let resync_action = gio::SimpleAction::new("resync", None);
+    resync_action.connect_activate(move |_, _| {
+        info!("Resync triggered by preferences change");
+        window.show_banner("Re-syncing\u{2026}");
+        trigger_sync_all_accounts(&accounts, &pool, &window, &msgs);
+    });
+    app.add_action(&resync_action);
+}
+
 /// Wire up the entire UI after data loads.
-fn setup_ui(window: MqWindow, data: AppData) {
+/// Returns the shared message list so callers (e.g. background sync) can keep it updated.
+fn setup_ui(window: MqWindow, data: AppData) -> Rc<RefCell<Vec<MessageData>>> {
     let pool = data.pool.clone();
     let account_emails = Arc::new(data.account_emails);
     let is_multi_account = data.accounts.len() > 1;
@@ -223,19 +345,17 @@ fn setup_ui(window: MqWindow, data: AppData) {
     // No accounts → show setup dialog
     if data.accounts.is_empty() {
         show_account_setup(&window, &pool);
-        return;
+        return Rc::new(RefCell::new(vec![]));
     }
 
     // Shared messages data — updated on each reload, read by selection handler.
     let shared_messages: Rc<RefCell<Vec<MessageData>>> =
         Rc::new(RefCell::new(data.messages.clone()));
 
-    // Populate message list (unified view)
     let show_badge = is_multi_account;
-    let objects = make_message_objects(&data.messages, &account_emails, show_badge);
-    window.message_list().set_messages(objects);
 
-    // Wire message selection (ONCE — reads from shared_messages)
+    // Wire message selection BEFORE populating the list, so the initial
+    // selection (item 0) triggers the handler and shows the first message.
     {
         let view = window.message_view();
         let pool_sel = pool.clone();
@@ -267,54 +387,440 @@ fn setup_ui(window: MqWindow, data: AppData) {
                     has_unsub,
                     msg.is_flagged(),
                     msg.is_read(),
+                    db_id,
                 );
 
+                // Auto-mark as read when viewing (single messages and
+                // the thread representative in the list)
+                if !msg.is_read() {
+                    msg.set_is_read(true);
+                    let pool_read = pool_sel.clone();
+                    let uid = msg.uid();
+                    let account_id = msg.account_id();
+                    let mailbox = msg.mailbox();
+                    // Local DB update (fast)
+                    runtime::spawn_async(
+                        async move {
+                            toggle_flag(&pool_read, db_id, "\\Seen", true).await;
+                        },
+                        |_| {},
+                    );
+                    // IMAP sync in background — don't block UI
+                    let pool_imap = pool_sel.clone();
+                    runtime::spawn_async(
+                        async move {
+                            if let Err(e) = imap_store_flag(
+                                &pool_imap, account_id, &mailbox, uid, "\\Seen", true,
+                            ).await {
+                                warn!("Failed to mark as read on server: {e}");
+                            }
+                        },
+                        |_| {},
+                    );
+                }
+
                 let pool = pool_sel.clone();
+                let pool_dl = pool_sel.clone();
                 let v = view.clone();
                 let sender = msg.sender_email();
                 let account = msg.account_id();
+                let thread_id = msg.gmail_thread_id();
+                let thread_count = msg.thread_count();
+
                 runtime::spawn_async(
                     async move {
-                        let body = load_message_body(&pool, db_id).await;
                         let allowed =
                             mq_db::queries::sender_allowlist::is_allowed(&pool, account, &sender)
                                 .await
                                 .unwrap_or(false);
-                        (body, allowed)
+
+                        // If this is a thread with multiple messages, load the full thread
+                        // Load attachments for this message
+                        let attachments = mq_db::queries::attachments::get_attachments(&pool, db_id)
+                            .await
+                            .unwrap_or_default();
+                        let att_data: Vec<(i64, String, String, Option<u64>)> = attachments
+                            .iter()
+                            .map(|a| (
+                                a.id,
+                                a.filename.clone().unwrap_or_default(),
+                                a.mime_type.clone(),
+                                a.size.map(|s| s as u64),
+                            ))
+                            .collect();
+
+                        if thread_count > 1 && thread_id != 0 {
+                            let thread_msgs = mq_db::queries::messages::get_thread_messages(
+                                &pool, thread_id,
+                            )
+                            .await
+                            .unwrap_or_default();
+
+                            // Load bodies for all messages in the thread
+                            // Tuple: (from, date, html, text)
+                            // (from, date, html, text, is_read)
+                            let mut conversation: Vec<(String, String, String, String, bool)> = Vec::new();
+                            let mut total_blocked = 0usize;
+                            let mut total_tracking = 0usize;
+
+                            let thread_len = thread_msgs.len();
+                            for (idx, tmsg) in thread_msgs.iter().enumerate() {
+                                let from_display = tmsg
+                                    .sender_name
+                                    .as_deref()
+                                    .filter(|n| !n.is_empty())
+                                    .map(|n| format!("{n} <{}>", tmsg.sender_email))
+                                    .unwrap_or_else(|| tmsg.sender_email.clone());
+                                let is_read = tmsg.flags.contains("\\Seen");
+
+                                let body = load_message_body(&pool, tmsg.id).await;
+                                let body_html = body
+                                    .as_ref()
+                                    .and_then(|b| b.html.clone())
+                                    .unwrap_or_default();
+                                let body_text = body
+                                    .as_ref()
+                                    .map(|b| b.text.clone())
+                                    .unwrap_or_else(|| {
+                                        tmsg.snippet.clone().unwrap_or_default()
+                                    });
+                                if let Some(ref b) = body {
+                                    total_blocked += b.blocked_images;
+                                    total_tracking += b.tracking_pixels;
+                                }
+
+                                // Last message is auto-expanded and always shown as read
+                                let show_read = is_read || idx == thread_len - 1;
+                                conversation.push((from_display, tmsg.date.clone(), body_html, body_text, show_read));
+                            }
+
+                            // Mark only the last message as read (it's auto-expanded)
+                            if let Some(last) = thread_msgs.last() {
+                                if !last.flags.contains("\\Seen") {
+                                    let last_id = last.id;
+                                    let last_uid = last.uid as u32;
+                                    let last_acct = last.account_id;
+                                    let last_mbox = last.mailbox.clone();
+                                    toggle_flag(&pool, last_id, "\\Seen", true).await;
+                                    let pool_bg = pool.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = imap_store_flag(
+                                            &pool_bg, last_acct, &last_mbox, last_uid, "\\Seen", true,
+                                        ).await {
+                                            tracing::warn!(last_id, "Failed to mark last thread msg as read: {e}");
+                                        }
+                                    });
+                                }
+                            }
+
+                            (None, Some(conversation), allowed, total_blocked, total_tracking, true, att_data)
+                        } else {
+                            // Single message — load just this one
+                            let body = load_message_body(&pool, db_id).await;
+                            let blocked = body.as_ref().map(|b| b.blocked_images).unwrap_or(0);
+                            let tracking = body.as_ref().map(|b| b.tracking_pixels).unwrap_or(0);
+                            let is_html = body.as_ref().map(|b| b.is_html).unwrap_or(false);
+                            (body, None, allowed, blocked, tracking, is_html, att_data)
+                        }
                     },
-                    move |(body, sender_allowed): (Option<BodyResult>, bool)| {
-                        if let Some(body) = body {
-                            v.set_body_text(&body.text);
-                            // Show privacy banners
-                            let config =
-                                mq_core::config::AppConfig::load().unwrap_or_default();
-                            let show_images_banner = config.privacy.block_remote_images
-                                && !sender_allowed
-                                && body.blocked_images > 0;
-                            if show_images_banner {
-                                v.show_images_banner(body.blocked_images);
+                    move |(body, conversation, sender_allowed, blocked, tracking, _is_html, att_data): (
+                        Option<BodyResult>,
+                        Option<Vec<(String, String, String, String, bool)>>,
+                        bool,
+                        usize,
+                        usize,
+                        bool,
+                        Vec<(i64, String, String, Option<u64>)>,
+                    )| {
+                        if let Some(conversation) = conversation {
+                            // Thread view: show full conversation
+                            v.set_conversation(&conversation);
+                        } else if let Some(body) = body {
+                            // Single message view — prefer HTML rendering
+                            if let Some(ref html) = body.html {
+                                v.set_body_html(html);
+                            } else {
+                                v.set_body_text(&body.text);
+                            }
+                        }
+
+                        // Show images banner only when remote images were actually blocked.
+                        // CID (inline) images are resolved to data: URIs and don't count.
+                        if !v.images_force_loaded() {
+                            if blocked > 0 && !sender_allowed {
+                                v.show_images_banner(blocked);
                             } else {
                                 v.hide_images_banner();
                             }
-                            if body.tracking_pixels > 0 {
-                                v.show_tracking_info(body.tracking_pixels);
-                            } else {
-                                v.hide_tracking_info();
+                        }
+                        if tracking > 0 {
+                            v.show_tracking_info(tracking);
+                        } else {
+                            v.hide_tracking_info();
+                        }
+
+                        // Show attachments if any
+                        if !att_data.is_empty() {
+                            if let Some(win) = v.root().and_then(|r| r.downcast::<MqWindow>().ok()) {
+                                let cb = make_attachment_download_callback(pool_dl.clone(), db_id, win);
+                                v.set_attachments(&att_data, cb);
                             }
+                        } else {
+                            v.hide_attachments();
                         }
                     },
                 );
             });
     }
 
+    // Populate message list AFTER the selection handler is connected,
+    // so the auto-selection of item 0 triggers the handler.
+    let objects = make_message_objects(&data.messages, &account_emails, show_badge);
+    window.message_list().set_messages(objects.clone());
+
+    // Directly show the first message — we can't rely on selection-changed
+    // because SingleSelection's internal auto-select of position 0 suppresses
+    // our signal when items are added to an empty model.
+    if !objects.is_empty() {
+        let msg = &objects[0];
+        let view = window.message_view();
+        let from = if msg.sender_name().is_empty() {
+            msg.sender_email()
+        } else {
+            format!("{} <{}>", msg.sender_name(), msg.sender_email())
+        };
+        let db_id = msg.db_id();
+        let to = shared_messages
+            .borrow()
+            .iter()
+            .find(|m| m.db_id == db_id)
+            .map(|m| m.recipient_to.clone())
+            .unwrap_or_default();
+        let has_unsub = shared_messages
+            .borrow()
+            .iter()
+            .find(|m| m.db_id == db_id)
+            .map(|m| m.list_unsubscribe.is_some())
+            .unwrap_or(false);
+        view.show_message(
+            &from,
+            &to,
+            &msg.date(),
+            &msg.subject(),
+            &msg.snippet(),
+            has_unsub,
+            msg.is_flagged(),
+            msg.is_read(),
+            db_id,
+        );
+        // Auto-mark first message as read in the list
+        if !msg.is_read() {
+            msg.set_is_read(true);
+        }
+
+        // Trigger async body load for the first message
+        let v = view.clone();
+        let pool_init = pool.clone();
+        let pool_dl2 = pool.clone();
+        let sender = msg.sender_email();
+        let account = msg.account_id();
+        let uid = msg.uid();
+        let mailbox = msg.mailbox();
+        let thread_id = msg.gmail_thread_id();
+        let thread_count = msg.thread_count();
+        runtime::spawn_async(
+            async move {
+                let allowed =
+                    mq_db::queries::sender_allowlist::is_allowed(&pool_init, account, &sender)
+                        .await
+                        .unwrap_or(false);
+                let attachments = mq_db::queries::attachments::get_attachments(&pool_init, db_id)
+                    .await
+                    .unwrap_or_default();
+                let att_data: Vec<(i64, String, String, Option<u64>)> = attachments
+                    .iter()
+                    .map(|a| (
+                        a.id,
+                        a.filename.clone().unwrap_or_default(),
+                        a.mime_type.clone(),
+                        a.size.map(|s| s as u64),
+                    ))
+                    .collect();
+
+                if thread_count > 1 && thread_id != 0 {
+                    let thread_msgs =
+                        mq_db::queries::messages::get_thread_messages(&pool_init, thread_id)
+                            .await
+                            .unwrap_or_default();
+                    let mut conversation: Vec<(String, String, String, String, bool)> = Vec::new();
+                    let mut total_blocked = 0usize;
+                    let mut total_tracking = 0usize;
+                    let thread_len = thread_msgs.len();
+                    for (idx, tmsg) in thread_msgs.iter().enumerate() {
+                        let from_display = tmsg
+                            .sender_name
+                            .as_deref()
+                            .filter(|n| !n.is_empty())
+                            .map(|n| format!("{n} <{}>", tmsg.sender_email))
+                            .unwrap_or_else(|| tmsg.sender_email.clone());
+                        let is_read = tmsg.flags.contains("\\Seen");
+                        let body = load_message_body(&pool_init, tmsg.id).await;
+                        let body_html = body
+                            .as_ref()
+                            .and_then(|b| b.html.clone())
+                            .unwrap_or_default();
+                        let body_text = body
+                            .as_ref()
+                            .map(|b| b.text.clone())
+                            .unwrap_or_else(|| tmsg.snippet.clone().unwrap_or_default());
+                        if let Some(ref b) = body {
+                            total_blocked += b.blocked_images;
+                            total_tracking += b.tracking_pixels;
+                        }
+                        let show_read = is_read || idx == thread_len - 1;
+                        conversation.push((from_display, tmsg.date.clone(), body_html, body_text, show_read));
+                    }
+                    // Mark only the last thread message as read
+                    if let Some(last) = thread_msgs.last() {
+                        if !last.flags.contains("\\Seen") {
+                            let last_id = last.id;
+                            let last_uid = last.uid as u32;
+                            let last_acct = last.account_id;
+                            let last_mbox = last.mailbox.clone();
+                            toggle_flag(&pool_init, last_id, "\\Seen", true).await;
+                            let pool_bg = pool_init.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = imap_store_flag(
+                                    &pool_bg, last_acct, &last_mbox, last_uid, "\\Seen", true,
+                                ).await {
+                                    tracing::warn!(last_id, "Failed to mark last thread msg as read: {e}");
+                                }
+                            });
+                        }
+                    }
+                    (None, Some(conversation), allowed, total_blocked, total_tracking, true, att_data)
+                } else {
+                    // Single message — mark as read
+                    toggle_flag(&pool_init, db_id, "\\Seen", true).await;
+                    let pool_bg = pool_init.clone();
+                    let uid_val = uid;
+                    let acct_val = account;
+                    let mbox_val = mailbox.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = imap_store_flag(
+                            &pool_bg, acct_val, &mbox_val, uid_val, "\\Seen", true,
+                        ).await {
+                            tracing::warn!(db_id, "Failed to mark as read on server: {e}");
+                        }
+                    });
+                    let body = load_message_body(&pool_init, db_id).await;
+                    let blocked = body.as_ref().map(|b| b.blocked_images).unwrap_or(0);
+                    let tracking = body.as_ref().map(|b| b.tracking_pixels).unwrap_or(0);
+                    let is_html = body.as_ref().map(|b| b.is_html).unwrap_or(false);
+                    (body, None, allowed, blocked, tracking, is_html, att_data)
+                }
+            },
+            move |(body, conversation, sender_allowed, blocked, tracking, _is_html, att_data): (
+                Option<BodyResult>,
+                Option<Vec<(String, String, String, String, bool)>>,
+                bool,
+                usize,
+                usize,
+                bool,
+                Vec<(i64, String, String, Option<u64>)>,
+            )| {
+                if let Some(conversation) = conversation {
+                    v.set_conversation(&conversation);
+                } else if let Some(body) = body {
+                    if let Some(ref html) = body.html {
+                        v.set_body_html(html);
+                    } else {
+                        v.set_body_text(&body.text);
+                    }
+                }
+                if !v.images_force_loaded() {
+                    if blocked > 0 && !sender_allowed {
+                        v.show_images_banner(blocked);
+                    } else {
+                        v.hide_images_banner();
+                    }
+                }
+                if tracking > 0 {
+                    v.show_tracking_info(tracking);
+                } else {
+                    v.hide_tracking_info();
+                }
+                if !att_data.is_empty() {
+                    if let Some(win) = v.root().and_then(|r| r.downcast::<MqWindow>().ok()) {
+                        let cb = make_attachment_download_callback(pool_dl2.clone(), db_id, win);
+                        v.set_attachments(&att_data, cb);
+                    }
+                } else {
+                    v.hide_attachments();
+                }
+            },
+        );
+    }
+
     // Wire action buttons (star, read, delete, archive)
-    wire_action_buttons(&window, &pool);
+    wire_action_buttons(&window, &pool, &shared_messages);
 
     // Wire compose & reply buttons
     wire_compose_buttons(&window, &pool, &data.accounts, &shared_messages);
 
     // Wire privacy / unsubscribe buttons
     wire_privacy_buttons(&window, &pool, &shared_messages);
+
+    // Re-render email view when the user switches between light and dark mode
+    {
+        let view = window.message_view();
+        adw::StyleManager::default().connect_dark_notify(move |_| {
+            view.reload_for_theme_change();
+        });
+    }
+
+    // Wire sort order toggle
+    {
+        let ml = window.message_list();
+        let ml2 = ml.clone();
+        let msgs = shared_messages.clone();
+        ml.connect_sort_changed(move |newest_first| {
+            let model = ml2.model();
+            let n = model.n_items();
+            if n == 0 {
+                return;
+            }
+
+            // Collect current items, reverse, and re-populate
+            let mut items: Vec<MessageObject> = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                if let Some(item) = model.item(i) {
+                    if let Ok(msg) = item.downcast::<MessageObject>() {
+                        items.push(msg);
+                    }
+                }
+            }
+
+            // Sort by date string (ISO format sorts lexicographically)
+            if newest_first {
+                items.sort_by(|a, b| b.date().cmp(&a.date()));
+            } else {
+                items.sort_by(|a, b| a.date().cmp(&b.date()));
+            }
+
+            // Also update shared messages to match
+            {
+                let mut m = msgs.borrow_mut();
+                if newest_first {
+                    m.sort_by(|a, b| b.date.cmp(&a.date));
+                } else {
+                    m.sort_by(|a, b| a.date.cmp(&b.date));
+                }
+            }
+
+            ml2.refresh_messages(items);
+        });
+    }
 
     // Wire sidebar: account selection → reload messages
     {
@@ -386,7 +892,15 @@ fn setup_ui(window: MqWindow, data: AppData) {
                         if let Err(e) = mq_core::keyring::delete_tokens(&email).await {
                             warn!(error = %e, "Failed to delete keyring tokens");
                         }
-                        // Delete messages + account from DB
+                        // Delete all account-related data from DB
+                        let _ = sqlx::query("DELETE FROM offline_queue WHERE account_id = ?")
+                            .bind(account_id)
+                            .execute(&*pool)
+                            .await;
+                        let _ = sqlx::query("DELETE FROM sender_image_allowlist WHERE account_id = ?")
+                            .bind(account_id)
+                            .execute(&*pool)
+                            .await;
                         let _ = sqlx::query("DELETE FROM messages WHERE account_id = ?")
                             .bind(account_id)
                             .execute(&*pool)
@@ -459,6 +973,8 @@ fn setup_ui(window: MqWindow, data: AppData) {
 
     // Wire network awareness (offline banner + reconnect)
     wire_network_awareness(&window, &pool, &account_emails, is_multi_account, &shared_messages);
+
+    shared_messages
 }
 
 // ---------------------------------------------------------------------------
@@ -583,11 +1099,11 @@ fn show_account_setup(window: &MqWindow, pool: &Arc<SqlitePool>) {
                             }
                         },
                         move |data: AppData| {
-                            setup_ui(window2.clone(), data);
+                            let shared_messages = setup_ui(window2.clone(), data);
 
                             // Phase 3: Background sync with progress banner
                             window2.show_banner("Syncing inbox\u{2026}");
-                            start_background_sync(window2, pool2, account_id, email, access_token);
+                            start_background_sync(window2, pool2, account_id, email, access_token, shared_messages);
                         },
                     );
                 }
@@ -607,6 +1123,7 @@ fn start_background_sync(
     account_id: i64,
     email: String,
     access_token: String,
+    shared_messages: Rc<RefCell<Vec<MessageData>>>,
 ) {
     let (tx, rx) = async_channel::unbounded::<SyncProgress>();
 
@@ -622,52 +1139,472 @@ fn start_background_sync(
         let mut session = match ImapSession::connect(&email, &access_token).await {
             Ok(s) => s,
             Err(e) => {
-                let _ = tx.send(SyncProgress::Error(format!("IMAP connect failed: {e}"))).await;
-                return;
+                tracing::warn!(email = %email, error = %e, "IMAP connect failed, attempting token refresh");
+                let _ = tx.send(SyncProgress::Status("Refreshing token\u{2026}".into())).await;
+
+                match mq_core::keyring::refresh_and_store(&email).await {
+                    Ok(new_token) => {
+                        tracing::info!(email = %email, "Token refreshed, retrying IMAP connect");
+                        match ImapSession::connect(&email, &new_token).await {
+                            Ok(s) => s,
+                            Err(e2) => {
+                                let _ = tx.send(SyncProgress::Error(format!("IMAP connect failed after token refresh: {e2}"))).await;
+                                return;
+                            }
+                        }
+                    }
+                    Err(refresh_err) => {
+                        let _ = tx.send(SyncProgress::Error(format!("IMAP connect failed: {e} (token refresh also failed: {refresh_err})"))).await;
+                        return;
+                    }
+                }
             }
         };
 
         let _ = tx.send(SyncProgress::Status("Fetching messages\u{2026}".into())).await;
 
-        let outcome = match sync::sync_mailbox(&mut session, "INBOX", None, &[]).await {
-            Ok(o) => o,
-            Err(e) => {
-                let _ = tx.send(SyncProgress::Error(format!("Sync failed: {e}"))).await;
-                return;
-            }
-        };
+        // Load config to determine which mailboxes to sync
+        let config = mq_core::config::AppConfig::load().unwrap_or_default();
 
-        let total = outcome.new_messages.len();
-        let _ = tx.send(SyncProgress::Status(format!("Saving {total} messages\u{2026}"))).await;
+        // Always sync the standard Gmail mailboxes shown in the sidebar.
+        // When sync_all_mailboxes is enabled, also sync user labels and
+        // any other mailboxes the server advertises.
+        let mut mailboxes: Vec<String> = vec![
+            "INBOX".to_string(),
+            "[Gmail]/Starred".to_string(),
+            "[Gmail]/Sent Mail".to_string(),
+            "[Gmail]/Drafts".to_string(),
+            "[Gmail]/Trash".to_string(),
+            "[Gmail]/Spam".to_string(),
+            "[Gmail]/All Mail".to_string(),
+        ];
 
-        // Persist messages to DB in batches, sending progress
-        for (i, email_msg) in outcome.new_messages.iter().enumerate() {
-            persist_email_to_db(&pool, account_id, "INBOX", email_msg, &outcome.new_state).await;
-
-            // Send progress every 25 messages
-            if (i + 1) % 25 == 0 || i + 1 == total {
-                let _ = tx.send(SyncProgress::Count(i + 1, total)).await;
+        if config.sync.sync_all_mailboxes {
+            match session.list_mailboxes().await {
+                Ok(list) => {
+                    // Add any mailboxes not already in our standard set
+                    for mb in list {
+                        if !mailboxes.contains(&mb) {
+                            mailboxes.push(mb);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to list additional mailboxes: {e}");
+                }
             }
         }
 
-        // Save sync state
-        let _ = mq_db::queries::sync_state::upsert_sync_state(
-            &pool,
-            account_id,
-            "INBOX",
-            outcome.new_state.uid_validity as i64,
-            outcome.new_state.highest_modseq as i64,
-            outcome.new_state.highest_uid as i64,
-        )
-        .await;
+        let mut grand_total = 0usize;
+        let mut idle_started = false;
 
-        let _ = session.logout().await;
-        let _ = tx.send(SyncProgress::Done(total)).await;
+        for mailbox in &mailboxes {
+            // Simple display name: strip leading "[Gmail]/" prefix if present
+            let display = if let Some(stripped) = mailbox.strip_prefix("[Gmail]/") {
+                stripped
+            } else {
+                mailbox.as_str()
+            };
+
+            let _ = tx.send(SyncProgress::Status(format!("Syncing {display}\u{2026}"))).await;
+
+            // Load previous sync state for incremental sync
+            let prev_state = mq_db::queries::sync_state::get_sync_state(&pool, account_id, mailbox)
+                .await
+                .ok()
+                .flatten()
+                .map(|s| sync::SyncState {
+                    mailbox: s.mailbox,
+                    uid_validity: s.uid_validity as u32,
+                    highest_modseq: s.highest_modseq as u64,
+                    highest_uid: s.highest_uid as u32,
+                });
+
+            let known_uids: Vec<u32> = mq_db::queries::messages::get_known_uids(&pool, account_id, mailbox)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|u| u as u32)
+                .collect();
+
+            if prev_state.is_some() {
+                tracing::info!(
+                    mailbox = %mailbox,
+                    known_uids = known_uids.len(),
+                    "Resuming incremental sync with previous state"
+                );
+            }
+
+            let outcome = match sync::sync_mailbox(&mut session, mailbox, prev_state.as_ref(), &known_uids).await {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!(mailbox = %mailbox, error = %e, "Sync failed for mailbox, skipping");
+                    let _ = tx.send(SyncProgress::Status(format!("Skipping {display} (error)"))).await;
+                    continue;
+                }
+            };
+
+            // Delete expunged messages (no longer on server)
+            if !outcome.expunged_uids.is_empty() {
+                match mq_db::queries::messages::delete_expunged(
+                    &pool, account_id, mailbox, &outcome.expunged_uids,
+                ).await {
+                    Ok(count) => {
+                        if count > 0 {
+                            tracing::info!(mailbox = %mailbox, count, "Deleted expunged messages from local DB");
+                        }
+                    }
+                    Err(e) => tracing::warn!(mailbox = %mailbox, error = %e, "Failed to delete expunged messages"),
+                }
+            }
+
+            let total = outcome.new_messages.len();
+            if total > 0 {
+                let _ = tx.send(SyncProgress::Status(format!("Syncing {display}\u{2026} 0/{total} messages"))).await;
+            }
+
+            // Track highest UID seen so far for incremental state saves.
+            // We always track the true highest UID regardless of processing order.
+            let mut running_highest_uid = prev_state.as_ref().map(|s| s.highest_uid).unwrap_or(0) as i64;
+            if let Some(max_uid) = outcome.new_messages.iter().map(|m| m.uid as i64).max() {
+                if max_uid > running_highest_uid {
+                    running_highest_uid = max_uid;
+                }
+            }
+
+            // Process newest messages first so the user sees recent mail quickly.
+            let mut messages_to_process: Vec<_> = outcome.new_messages.iter().collect();
+            messages_to_process.reverse();
+
+            // Persist messages to DB in batches, sending progress
+            for (i, email_msg) in messages_to_process.iter().enumerate() {
+                let db_id = persist_email_to_db(&pool, account_id, mailbox, email_msg, &outcome.new_state).await;
+
+                // Fetch and persist message body (skip if already cached)
+                if let Some(db_id) = db_id {
+                    let already_has_body = mq_db::queries::message_bodies::has_body(&pool, db_id)
+                        .await
+                        .unwrap_or(false);
+
+                    if !already_has_body {
+                        match session.fetch_body(email_msg.uid).await {
+                            Ok(Some(raw)) => {
+                                let parsed = mq_core::body::parse_mime(&raw);
+
+                                if let Err(e) = mq_db::queries::message_bodies::upsert_body(
+                                    &pool,
+                                    db_id,
+                                    Some(&raw),
+                                    parsed.html.as_deref(),
+                                    parsed.text.as_deref(),
+                                )
+                                .await
+                                {
+                                    tracing::warn!(db_id, error = %e, "Failed to persist message body");
+                                }
+
+                                // Save snippet to messages table for list display
+                                if let Some(ref snippet) = parsed.snippet {
+                                    let _ = mq_db::queries::messages::update_snippet(
+                                        &pool, db_id, snippet,
+                                    ).await;
+                                }
+
+                                // Store attachment metadata
+                                if !parsed.attachments.is_empty() {
+                                    for att in &parsed.attachments {
+                                        let _ = mq_db::queries::attachments::insert_attachment(
+                                            &pool,
+                                            db_id,
+                                            att.filename.as_deref(),
+                                            &att.mime_type,
+                                            att.size.map(|s| s as i64),
+                                            att.content_id.as_deref(),
+                                            &att.imap_section,
+                                        ).await;
+                                    }
+                                    // Update has_attachments flag on message
+                                    let _ = sqlx::query(
+                                        "UPDATE messages SET has_attachments = 1 WHERE id = ?",
+                                    )
+                                    .bind(db_id)
+                                    .execute(&*pool)
+                                    .await;
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::debug!(uid = email_msg.uid, "No body returned for message");
+                            }
+                            Err(e) => {
+                                tracing::warn!(uid = email_msg.uid, error = %e, "Failed to fetch message body");
+                            }
+                        }
+                    }
+
+                    // Persist labels
+                    if !email_msg.labels.is_empty() {
+                        let mut label_ids = Vec::new();
+                        for label in &email_msg.labels {
+                            let label_type = if label.starts_with('\\') { "system" } else { "user" };
+                            match mq_db::queries::labels::upsert_label(
+                                &pool,
+                                account_id,
+                                label,
+                                label,
+                                label_type,
+                            )
+                            .await
+                            {
+                                Ok(lid) => label_ids.push(lid),
+                                Err(e) => {
+                                    tracing::warn!(label = %label, error = %e, "Failed to upsert label");
+                                }
+                            }
+                        }
+                        if !label_ids.is_empty() {
+                            if let Err(e) = mq_db::queries::labels::set_message_labels(&pool, db_id, &label_ids).await {
+                                tracing::warn!(db_id, error = %e, "Failed to set message labels");
+                            }
+                        }
+                    }
+                }
+
+                // Send progress + save sync state every 50 messages
+                // so restarts don't re-download everything
+                if (i + 1) % 25 == 0 || i + 1 == total {
+                    let _ = tx.send(SyncProgress::Status(format!("Syncing {display}\u{2026} {}/{total} messages", i + 1))).await;
+                    let _ = tx.send(SyncProgress::Count(i + 1, total)).await;
+                }
+                if (i + 1) % 50 == 0 {
+                    let _ = mq_db::queries::sync_state::upsert_sync_state(
+                        &pool,
+                        account_id,
+                        mailbox,
+                        outcome.new_state.uid_validity as i64,
+                        outcome.new_state.highest_modseq as i64,
+                        running_highest_uid,
+                    )
+                    .await;
+                }
+            }
+
+            grand_total += total;
+
+            // Save final sync state for this mailbox
+            let _ = mq_db::queries::sync_state::upsert_sync_state(
+                &pool,
+                account_id,
+                mailbox,
+                outcome.new_state.uid_validity as i64,
+                outcome.new_state.highest_modseq as i64,
+                outcome.new_state.highest_uid as i64,
+            )
+            .await;
+
+            // After INBOX sync, start IDLE on a second connection so new
+            // incoming mail is immediately detected even while remaining
+            // mailboxes are still syncing.
+            if mailbox == "INBOX" && !idle_started {
+                idle_started = true;
+                let idle_email = email.clone();
+                let idle_token = access_token.clone();
+                let idle_pool = pool.clone();
+                let idle_tx = tx.clone();
+                let idle_account_id = account_id;
+                tokio::spawn(async move {
+                    use mq_core::imap::client::ImapSession;
+                    use mq_core::imap::idle::{idle_loop, IdleEvent};
+                    use tokio::sync::mpsc as tokio_mpsc;
+
+                    let idle_session = match ImapSession::connect(&idle_email, &idle_token).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!("Failed to open IDLE connection: {e}");
+                            return;
+                        }
+                    };
+                    tracing::info!("Started IDLE connection alongside sync");
+
+                    let (cancel_tx, cancel_rx) = tokio_mpsc::channel::<()>(1);
+                    let (event_tx, mut event_rx) = tokio_mpsc::unbounded_channel::<IdleEvent>();
+                    let _cancel_guard = cancel_tx;
+
+                    let mut maybe_session = idle_loop(idle_session, "INBOX", event_tx.clone(), cancel_rx).await;
+
+                    while let Some(event) = event_rx.recv().await {
+                        match event {
+                            IdleEvent::NewData => {
+                                let session = match maybe_session.take() {
+                                    Some(s) => s,
+                                    None => break,
+                                };
+
+                                let _ = idle_tx.send(SyncProgress::NewMail).await;
+
+                                let (synced_session, new_count) = run_idle_sync(
+                                    session, &idle_pool, idle_account_id, &idle_tx,
+                                ).await;
+
+                                match synced_session {
+                                    Some(s) => {
+                                        if new_count > 0 {
+                                            let _ = idle_tx.send(SyncProgress::Done(new_count)).await;
+                                        } else {
+                                            let _ = idle_tx.send(SyncProgress::IdleResumed).await;
+                                        }
+                                        let (_new_cancel_tx, new_cancel_rx) = tokio_mpsc::channel::<()>(1);
+                                        maybe_session = idle_loop(s, "INBOX", event_tx.clone(), new_cancel_rx).await;
+                                    }
+                                    None => {
+                                        let _ = idle_tx.send(SyncProgress::Error("IDLE connection lost during sync".into())).await;
+                                        break;
+                                    }
+                                }
+                            }
+                            IdleEvent::Timeout => continue,
+                            IdleEvent::ConnectionLost => {
+                                tracing::warn!("IDLE connection lost during bulk sync");
+                                // Will be re-established after bulk sync finishes
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Some(session) = maybe_session {
+                        let _ = session.logout().await;
+                    }
+                });
+            }
+        }
+
+        // --- Contacts sync (Google People API) ---
+        let _ = tx.send(SyncProgress::Status("Syncing contacts\u{2026}".into())).await;
+        {
+            // Get a fresh token for the People API
+            let contacts_token = match mq_core::keyring::get_tokens(&email).await {
+                Ok(Some(t)) => t.access_token,
+                _ => access_token.clone(),
+            };
+            let contacts = mq_core::contacts::fetch_contacts_graceful(&contacts_token).await;
+            if !contacts.is_empty() {
+                let mut saved = 0u32;
+                for c in &contacts {
+                    if mq_db::queries::contacts::upsert_contact(
+                        &pool,
+                        account_id,
+                        if c.resource_id.is_empty() { None } else { Some(c.resource_id.as_str()) },
+                        c.display_name.as_deref(),
+                        &c.email,
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        saved += 1;
+                    }
+                }
+                tracing::info!(saved, "Contacts synced to local DB");
+            }
+        }
+
+        let _ = tx.send(SyncProgress::Done(grand_total)).await;
+
+        // --- IMAP IDLE: stay connected and watch for new mail ---
+        let _ = tx.send(SyncProgress::Status("Watching for new mail\u{2026}".into())).await;
+
+        use mq_core::imap::idle::{idle_loop, IdleEvent};
+        use tokio::sync::mpsc as tokio_mpsc;
+
+        let (cancel_tx, cancel_rx) = tokio_mpsc::channel::<()>(1);
+        let (event_tx, mut event_rx) = tokio_mpsc::unbounded_channel::<IdleEvent>();
+
+        // Keep cancel_tx alive so IDLE doesn't get cancelled prematurely.
+        // It will be dropped when the entire spawned task exits (app shutdown).
+        let _cancel_guard = cancel_tx;
+
+        // Enter initial IDLE
+        let mut maybe_session = idle_loop(session, "INBOX", event_tx.clone(), cancel_rx).await;
+
+        // Process IDLE events in a loop
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                IdleEvent::NewData => {
+                    let session = match maybe_session.take() {
+                        Some(s) => s,
+                        None => break, // lost session
+                    };
+
+                    let _ = tx.send(SyncProgress::Status("New mail — syncing\u{2026}".into())).await;
+                    let _ = tx.send(SyncProgress::NewMail).await;
+
+                    // Run incremental sync on INBOX
+                    let (synced_session, new_count) = run_idle_sync(
+                        session, &pool, account_id, &tx,
+                    ).await;
+
+                    match synced_session {
+                        Some(s) => {
+                            if new_count > 0 {
+                                let _ = tx.send(SyncProgress::Done(new_count)).await;
+                            } else {
+                                let _ = tx.send(SyncProgress::IdleResumed).await;
+                            }
+                            // Re-enter IDLE
+                            let (_new_cancel_tx, new_cancel_rx) = tokio_mpsc::channel::<()>(1);
+                            maybe_session = idle_loop(s, "INBOX", event_tx.clone(), new_cancel_rx).await;
+                        }
+                        None => {
+                            let _ = tx.send(SyncProgress::Error("Lost connection during sync".into())).await;
+                            break;
+                        }
+                    }
+                }
+                IdleEvent::Timeout => {
+                    // Re-entered automatically by idle_loop
+                    continue;
+                }
+                IdleEvent::ConnectionLost => {
+                    tracing::warn!("IDLE connection lost, will retry in 30s");
+                    let _ = tx.send(SyncProgress::Status("Connection lost — reconnecting\u{2026}".into())).await;
+
+                    // Wait and try to reconnect
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+                    // Get fresh token
+                    let new_token = match mq_core::keyring::refresh_and_store(&email).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            let _ = tx.send(SyncProgress::Error(format!("Reconnect failed: {e}"))).await;
+                            break;
+                        }
+                    };
+
+                    match ImapSession::connect(&email, &new_token).await {
+                        Ok(s) => {
+                            let _ = tx.send(SyncProgress::IdleResumed).await;
+                            let (_new_cancel_tx, new_cancel_rx) = tokio_mpsc::channel::<()>(1);
+                            maybe_session = idle_loop(s, "INBOX", event_tx.clone(), new_cancel_rx).await;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(SyncProgress::Error(format!("Reconnect failed: {e}"))).await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // If we exit the IDLE loop, try to log out cleanly
+        if let Some(session) = maybe_session {
+            let _ = session.logout().await;
+        }
     });
 
-    // UI-side: receive progress updates on the GTK main thread
+    // UI-side: receive progress updates on the GTK main thread.
+    // This channel stays open for the lifetime of the IDLE connection,
+    // so we don't break on Done — only on Error or channel close.
     let w = window.clone();
     let p = pool;
+    let sm = shared_messages;
     glib::spawn_future_local(async move {
         while let Ok(progress) = rx.recv().await {
             match progress {
@@ -675,11 +1612,21 @@ fn start_background_sync(
                     w.show_banner(&msg);
                 }
                 SyncProgress::Count(done, total) => {
-                    w.show_banner(&format!("Syncing inbox\u{2026} {done}/{total} messages"));
-                    refresh_message_list_from_db(&w, &p);
+                    let fraction = if total > 0 {
+                        done as f64 / total as f64
+                    } else {
+                        0.0
+                    };
+                    w.hide_banner();
+                    w.show_progress(
+                        &format!("Syncing\u{2026} {done}/{total} messages"),
+                        fraction,
+                    );
+                    refresh_message_list_from_db(&w, &p, &sm);
                 }
                 SyncProgress::Error(msg) => {
                     error!("Background sync error: {msg}");
+                    w.hide_progress();
                     w.show_banner(&format!("Sync error: {msg}"));
                     let w2 = w.clone();
                     glib::timeout_add_local_once(std::time::Duration::from_secs(5), move || {
@@ -688,10 +1635,20 @@ fn start_background_sync(
                     break;
                 }
                 SyncProgress::Done(total) => {
-                    info!(total, "Background sync complete");
+                    info!(total, "Sync complete");
+                    w.hide_progress();
                     w.hide_banner();
-                    refresh_message_list_from_db(&w, &p);
-                    break;
+                    // Reload the selected thread so new messages show up
+                    refresh_and_reload_selected(&w, &p, &sm);
+                    // Don't break — IDLE keeps the channel alive
+                }
+                SyncProgress::NewMail => {
+                    // Brief banner while IDLE-triggered sync runs
+                    w.show_banner("New mail — syncing\u{2026}");
+                }
+                SyncProgress::IdleResumed => {
+                    w.hide_progress();
+                    w.hide_banner();
                 }
             }
         }
@@ -703,39 +1660,342 @@ enum SyncProgress {
     Count(usize, usize),
     Error(String),
     Done(usize),
+    /// IDLE detected new mail — show a brief indicator.
+    NewMail,
+    /// IDLE resumed watching — clear any banners.
+    IdleResumed,
+}
+
+/// Run an incremental sync on INBOX after IDLE detects new data.
+/// Returns the session (if still valid) and the count of new messages.
+async fn run_idle_sync(
+    mut session: mq_core::imap::client::ImapSession,
+    pool: &SqlitePool,
+    account_id: i64,
+    tx: &async_channel::Sender<SyncProgress>,
+) -> (Option<mq_core::imap::client::ImapSession>, usize) {
+    use mq_core::imap::sync;
+
+    let mailbox = "INBOX";
+
+    let prev_state = mq_db::queries::sync_state::get_sync_state(pool, account_id, mailbox)
+        .await
+        .ok()
+        .flatten()
+        .map(|s| sync::SyncState {
+            mailbox: s.mailbox,
+            uid_validity: s.uid_validity as u32,
+            highest_modseq: s.highest_modseq as u64,
+            highest_uid: s.highest_uid as u32,
+        });
+
+    let known_uids: Vec<u32> = mq_db::queries::messages::get_known_uids(pool, account_id, mailbox)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|u| u as u32)
+        .collect();
+
+    let outcome = match sync::sync_mailbox(&mut session, mailbox, prev_state.as_ref(), &known_uids).await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(error = %e, "IDLE sync failed");
+            let _ = tx.send(SyncProgress::Error(format!("Sync failed: {e}"))).await;
+            return (None, 0);
+        }
+    };
+
+    // Delete expunged messages
+    if !outcome.expunged_uids.is_empty() {
+        if let Ok(count) = mq_db::queries::messages::delete_expunged(
+            pool, account_id, mailbox, &outcome.expunged_uids,
+        ).await {
+            if count > 0 {
+                tracing::info!(count, "IDLE sync: deleted expunged messages");
+            }
+        }
+    }
+
+    let total = outcome.new_messages.len();
+
+    for (i, email_msg) in outcome.new_messages.iter().enumerate() {
+        let db_id = persist_email_to_db(pool, account_id, mailbox, email_msg, &outcome.new_state).await;
+
+        if let Some(db_id) = db_id {
+            // Skip body fetch if already cached
+            let already_has_body = mq_db::queries::message_bodies::has_body(pool, db_id)
+                .await
+                .unwrap_or(false);
+
+            if !already_has_body {
+                match session.fetch_body(email_msg.uid).await {
+                    Ok(Some(raw)) => {
+                        let parsed = mq_core::body::parse_mime(&raw);
+                        let _ = mq_db::queries::message_bodies::upsert_body(
+                            pool, db_id, Some(&raw), parsed.html.as_deref(), parsed.text.as_deref(),
+                        ).await;
+                        // Save snippet to messages table for list display
+                        if let Some(ref snippet) = parsed.snippet {
+                            let _ = mq_db::queries::messages::update_snippet(pool, db_id, snippet).await;
+                        }
+                        // Store attachment metadata
+                        if !parsed.attachments.is_empty() {
+                            for att in &parsed.attachments {
+                                let _ = mq_db::queries::attachments::insert_attachment(
+                                    pool,
+                                    db_id,
+                                    att.filename.as_deref(),
+                                    &att.mime_type,
+                                    att.size.map(|s| s as i64),
+                                    att.content_id.as_deref(),
+                                    &att.imap_section,
+                                ).await;
+                            }
+                            let _ = sqlx::query(
+                                "UPDATE messages SET has_attachments = 1 WHERE id = ?",
+                            )
+                            .bind(db_id)
+                            .execute(pool)
+                            .await;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(uid = email_msg.uid, error = %e, "Failed to fetch body during IDLE sync");
+                    }
+                }
+            }
+
+            if !email_msg.labels.is_empty() {
+                let mut label_ids = Vec::new();
+                for label in &email_msg.labels {
+                    let label_type = if label.starts_with('\\') { "system" } else { "user" };
+                    if let Ok(lid) = mq_db::queries::labels::upsert_label(pool, account_id, label, label, label_type).await {
+                        label_ids.push(lid);
+                    }
+                }
+                if !label_ids.is_empty() {
+                    let _ = mq_db::queries::labels::set_message_labels(pool, db_id, &label_ids).await;
+                }
+            }
+        }
+
+        if total > 5 && ((i + 1) % 5 == 0 || i + 1 == total) {
+            let _ = tx.send(SyncProgress::Count(i + 1, total)).await;
+        }
+    }
+
+    // Save sync state
+    let _ = mq_db::queries::sync_state::upsert_sync_state(
+        pool, account_id, mailbox,
+        outcome.new_state.uid_validity as i64,
+        outcome.new_state.highest_modseq as i64,
+        outcome.new_state.highest_uid as i64,
+    ).await;
+
+    (Some(session), total)
 }
 
 /// Quick refresh of the message list from DB (called during/after sync).
-fn refresh_message_list_from_db(window: &MqWindow, pool: &Arc<SqlitePool>) {
+/// Uses threaded query to group messages by gmail_thread_id.
+/// Also updates `shared_messages` so the selection handler has current data.
+/// Uses `refresh_messages` to preserve the user's current selection.
+/// When no message was previously selected, directly triggers the message
+/// view for item 0 (cannot rely on `selection-changed` signal due to
+/// GTK `SingleSelection` auto-select races).
+fn refresh_message_list_from_db(
+    window: &MqWindow,
+    pool: &Arc<SqlitePool>,
+    shared_messages: &Rc<RefCell<Vec<MessageData>>>,
+) {
+    refresh_message_list_impl(window, pool, shared_messages, false);
+}
+
+/// Like `refresh_message_list_from_db` but also reloads the currently selected
+/// message/thread view (e.g. after send or IDLE sync delivers new messages).
+fn refresh_and_reload_selected(
+    window: &MqWindow,
+    pool: &Arc<SqlitePool>,
+    shared_messages: &Rc<RefCell<Vec<MessageData>>>,
+) {
+    refresh_message_list_impl(window, pool, shared_messages, true);
+}
+
+fn refresh_message_list_impl(
+    window: &MqWindow,
+    pool: &Arc<SqlitePool>,
+    shared_messages: &Rc<RefCell<Vec<MessageData>>>,
+    reload_selected: bool,
+) {
     let ml = window.message_list();
+    let view = window.message_view();
     let pool = pool.clone();
-    // We need account_emails for badge display but for a quick refresh
-    // we just reload without badges.
+    let pool2 = pool.clone();
+    let msgs = shared_messages.clone();
+    let msgs2 = shared_messages.clone();
+    // Use the currently selected mailbox, not hardcoded INBOX
+    let current_mailbox = window.sidebar().selected_mailbox();
     runtime::spawn_async(
         async move {
-            mq_db::queries::messages::get_messages_all_accounts_for_mailbox(
-                &pool, "INBOX", 200, 0,
+            mq_db::queries::messages::get_threads_for_mailbox(
+                &pool, &current_mailbox, 200, 0,
             )
             .await
             .unwrap_or_default()
         },
-        move |messages: Vec<mq_db::models::DbMessage>| {
-            let data = db_to_message_data(messages);
+        move |threads: Vec<(mq_db::models::DbMessage, i64)>| {
+            let data = db_to_threaded_message_data(threads);
             let empty_emails = HashMap::new();
             let objects = make_message_objects(&data, &empty_emails, false);
-            ml.set_messages(objects);
+            *msgs.borrow_mut() = data;
+
+            // refresh_messages suppresses selection-changed during model swap
+            // when re-selecting the same message, so the message view won't reload.
+            let had_selection = {
+                let sel = ml.selection();
+                sel.selected() != gtk::INVALID_LIST_POSITION
+                    && sel.selected_item().is_some()
+            };
+            ml.refresh_messages(objects);
+
+            if had_selection {
+                if reload_selected {
+                    // Force the selection handler to re-fire so the thread
+                    // view reloads (e.g. after send or IDLE sync).
+                    let sel = ml.selection();
+                    let pos = sel.selected();
+                    sel.set_selected(gtk::INVALID_LIST_POSITION);
+                    let s = sel.clone();
+                    glib::idle_add_local_once(move || {
+                        s.set_autoselect(true);
+                        s.set_selected(pos);
+                    });
+                }
+                return;
+            }
+
+            // If there was no prior selection, directly show the first message.
+            // We can't rely on `selection-changed` because SingleSelection's
+            // internal auto-select of position 0 can suppress our signal.
+            let model = ml.model();
+            if model.n_items() > 0 {
+                if let Some(item) = model.item(0) {
+                    if let Ok(msg) = item.downcast::<MessageObject>() {
+                        let from = if msg.sender_name().is_empty() {
+                            msg.sender_email()
+                        } else {
+                            format!("{} <{}>", msg.sender_name(), msg.sender_email())
+                        };
+                        let db_id = msg.db_id();
+                        let to = {
+                            let m = msgs2.borrow();
+                            m.iter()
+                                .find(|m| m.db_id == db_id)
+                                .map(|m| m.recipient_to.clone())
+                                .unwrap_or_default()
+                        };
+                        let has_unsub = {
+                            let m = msgs2.borrow();
+                            m.iter()
+                                .find(|m| m.db_id == db_id)
+                                .map(|m| m.list_unsubscribe.is_some())
+                                .unwrap_or(false)
+                        };
+                        view.show_message(
+                            &from,
+                            &to,
+                            &msg.date(),
+                            &msg.subject(),
+                            &msg.snippet(),
+                            has_unsub,
+                            msg.is_flagged(),
+                            msg.is_read(),
+                            db_id,
+                        );
+                        let v = view.clone();
+                        let pool_dl3 = pool2.clone();
+                        let sender = msg.sender_email();
+                        let account = msg.account_id();
+                        runtime::spawn_async(
+                            async move {
+                                let allowed =
+                                    mq_db::queries::sender_allowlist::is_allowed(
+                                        &pool2, account, &sender,
+                                    )
+                                    .await
+                                    .unwrap_or(false);
+                                let body = load_message_body(&pool2, db_id).await;
+                                let blocked =
+                                    body.as_ref().map(|b| b.blocked_images).unwrap_or(0);
+                                let tracking =
+                                    body.as_ref().map(|b| b.tracking_pixels).unwrap_or(0);
+                                let is_html =
+                                    body.as_ref().map(|b| b.is_html).unwrap_or(false);
+                                let attachments = mq_db::queries::attachments::get_attachments(&pool2, db_id)
+                                    .await
+                                    .unwrap_or_default();
+                                let att_data: Vec<(i64, String, String, Option<u64>)> = attachments
+                                    .iter()
+                                    .map(|a| (
+                                        a.id,
+                                        a.filename.clone().unwrap_or_default(),
+                                        a.mime_type.clone(),
+                                        a.size.map(|s| s as u64),
+                                    ))
+                                    .collect();
+                                (body, allowed, blocked, tracking, is_html, att_data)
+                            },
+                            move |(body, sender_allowed, blocked, tracking, _is_html, att_data): (
+                                Option<BodyResult>,
+                                bool,
+                                usize,
+                                usize,
+                                bool,
+                                Vec<(i64, String, String, Option<u64>)>,
+                            )| {
+                                if let Some(body) = body {
+                                    if let Some(ref html) = body.html {
+                                        v.set_body_html(html);
+                                    } else {
+                                        v.set_body_text(&body.text);
+                                    }
+                                }
+                                if blocked > 0 && !sender_allowed {
+                                    v.show_images_banner(blocked);
+                                } else {
+                                    v.hide_images_banner();
+                                }
+                                if tracking > 0 {
+                                    v.show_tracking_info(tracking);
+                                } else {
+                                    v.hide_tracking_info();
+                                }
+                                if !att_data.is_empty() {
+                                    if let Some(win) = v.root().and_then(|r| r.downcast::<MqWindow>().ok()) {
+                                        let cb = make_attachment_download_callback(pool_dl3.clone(), db_id, win);
+                                        v.set_attachments(&att_data, cb);
+                                    }
+                                } else {
+                                    v.hide_attachments();
+                                }
+                            },
+                        );
+                    }
+                }
+            }
         },
     );
 }
 
 /// Persist a single email from sync to the database.
+/// Returns the DB message ID on success, or `None` if the upsert failed.
 async fn persist_email_to_db(
     pool: &SqlitePool,
     account_id: i64,
     mailbox: &str,
     email_msg: &mq_core::email::Email,
     new_state: &mq_core::imap::sync::SyncState,
-) {
+) -> Option<i64> {
     let flags = flags_to_string(&email_msg.flags);
     let from = email_msg.from.as_ref();
     let sender_name = from.and_then(|a| a.name.as_deref());
@@ -769,7 +2029,7 @@ async fn persist_email_to_db(
         serde_json::to_string(&email_msg.references).ok()
     };
 
-    let _ = mq_db::queries::messages::upsert_message(
+    match mq_db::queries::messages::upsert_message(
         pool,
         account_id,
         email_msg.uid as i64,
@@ -785,7 +2045,7 @@ async fn persist_email_to_db(
         recipient_cc.as_deref(),
         email_msg.subject.as_deref(),
         email_msg.snippet.as_deref(),
-        email_msg.date.as_deref().unwrap_or(""),
+        &email_msg.date.as_deref().map(mq_core::email::normalize_date).unwrap_or_default(),
         &flags,
         email_msg.has_attachments,
         None,
@@ -794,7 +2054,14 @@ async fn persist_email_to_db(
         None,
         new_state.uid_validity as i64,
     )
-    .await;
+    .await
+    {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::warn!("Failed to persist email: {e}");
+            None
+        }
+    }
 }
 
 /// Convert MessageFlags to a space-separated IMAP flag string.
@@ -834,28 +2101,22 @@ fn reload_messages(
     let mailbox = mailbox.to_string();
     let show_badge = is_multi_account && account_id.is_none();
     let pool = pool.clone();
+    let pool2 = pool.clone();
     let emails = account_emails.clone();
     let msgs = shared_messages.clone();
+    let msgs2 = shared_messages.clone();
     let ml = window.message_list();
     let mv = window.message_view();
 
     runtime::spawn_async(
         async move {
-            let messages = match account_id {
-                Some(aid) => mq_db::queries::messages::get_messages_for_mailbox(
-                    &pool, aid, &mailbox, 200, 0,
-                )
-                .await
-                .unwrap_or_default(),
-                None => {
-                    mq_db::queries::messages::get_messages_all_accounts_for_mailbox(
-                        &pool, &mailbox, 200, 0,
-                    )
-                    .await
-                    .unwrap_or_default()
-                }
-            };
-            (db_to_message_data(messages), emails, show_badge)
+            // Use threaded query to group by gmail_thread_id
+            let threads = mq_db::queries::messages::get_threads_for_mailbox(
+                &pool, &mailbox, 200, 0,
+            )
+            .await
+            .unwrap_or_default();
+            (db_to_threaded_message_data(threads), emails, show_badge)
         },
         move |(messages, emails, show_badge): (
             Vec<MessageData>,
@@ -863,16 +2124,172 @@ fn reload_messages(
             bool,
         )| {
             let objects = make_message_objects(&messages, &emails, show_badge);
+            let has_messages = !objects.is_empty();
             // Update shared state so the selection handler has current data
             *msgs.borrow_mut() = messages;
             ml.set_messages(objects);
-            mv.show_placeholder();
+
+            if !has_messages {
+                mv.show_placeholder();
+                return;
+            }
+
+            // GTK SingleSelection may suppress selection-changed when it
+            // auto-selects position 0. Directly load the first message so
+            // switching views always updates the message pane.
+            if let Some(item) = ml.model().item(0) {
+                if let Ok(msg) = item.downcast::<MessageObject>() {
+                    let from = if msg.sender_name().is_empty() {
+                        msg.sender_email()
+                    } else {
+                        format!("{} <{}>", msg.sender_name(), msg.sender_email())
+                    };
+                    let db_id = msg.db_id();
+                    let to = {
+                        let m = msgs2.borrow();
+                        m.iter()
+                            .find(|m| m.db_id == db_id)
+                            .map(|m| m.recipient_to.clone())
+                            .unwrap_or_default()
+                    };
+                    let has_unsub = {
+                        let m = msgs2.borrow();
+                        m.iter()
+                            .find(|m| m.db_id == db_id)
+                            .map(|m| m.list_unsubscribe.is_some())
+                            .unwrap_or(false)
+                    };
+                    mv.show_message(
+                        &from,
+                        &to,
+                        &msg.date(),
+                        &msg.subject(),
+                        &msg.snippet(),
+                        has_unsub,
+                        msg.is_flagged(),
+                        msg.is_read(),
+                        db_id,
+                    );
+                    let v = mv.clone();
+                    let pool_dl4 = pool2.clone();
+                    let sender = msg.sender_email();
+                    let account = msg.account_id();
+                    let thread_id = msg.gmail_thread_id();
+                    let thread_count = msg.thread_count();
+                    runtime::spawn_async(
+                        async move {
+                            let allowed =
+                                mq_db::queries::sender_allowlist::is_allowed(
+                                    &pool2, account, &sender,
+                                )
+                                .await
+                                .unwrap_or(false);
+
+                            let attachments = mq_db::queries::attachments::get_attachments(&pool2, db_id)
+                                .await
+                                .unwrap_or_default();
+                            let att_data: Vec<(i64, String, String, Option<u64>)> = attachments
+                                .iter()
+                                .map(|a| (
+                                    a.id,
+                                    a.filename.clone().unwrap_or_default(),
+                                    a.mime_type.clone(),
+                                    a.size.map(|s| s as u64),
+                                ))
+                                .collect();
+
+                            if thread_count > 1 && thread_id != 0 {
+                                let thread_msgs = mq_db::queries::messages::get_thread_messages(
+                                    &pool2, thread_id,
+                                )
+                                .await
+                                .unwrap_or_default();
+
+                                let mut conversation: Vec<(String, String, String, String, bool)> = Vec::new();
+                                let mut total_blocked = 0usize;
+                                let mut total_tracking = 0usize;
+
+                                for tmsg in &thread_msgs {
+                                    let from_display = tmsg
+                                        .sender_name
+                                        .as_deref()
+                                        .filter(|n| !n.is_empty())
+                                        .map(|n| format!("{n} <{}>", tmsg.sender_email))
+                                        .unwrap_or_else(|| tmsg.sender_email.clone());
+                                    let is_read = tmsg.flags.contains("\\Seen");
+
+                                    let body = load_message_body(&pool2, tmsg.id).await;
+                                    let body_html = body
+                                        .as_ref()
+                                        .and_then(|b| b.html.clone())
+                                        .unwrap_or_default();
+                                    let body_text = body
+                                        .as_ref()
+                                        .map(|b| b.text.clone())
+                                        .unwrap_or_else(|| {
+                                            tmsg.snippet.clone().unwrap_or_default()
+                                        });
+                                    if let Some(ref b) = body {
+                                        total_blocked += b.blocked_images;
+                                        total_tracking += b.tracking_pixels;
+                                    }
+
+                                    conversation.push((from_display, tmsg.date.clone(), body_html, body_text, is_read));
+                                }
+
+                                (None, Some(conversation), allowed, total_blocked, total_tracking, att_data)
+                            } else {
+                                let body = load_message_body(&pool2, db_id).await;
+                                let blocked = body.as_ref().map(|b| b.blocked_images).unwrap_or(0);
+                                let tracking = body.as_ref().map(|b| b.tracking_pixels).unwrap_or(0);
+                                (body, None, allowed, blocked, tracking, att_data)
+                            }
+                        },
+                        move |(body, conversation, sender_allowed, blocked, tracking, att_data): (
+                            Option<BodyResult>,
+                            Option<Vec<(String, String, String, String, bool)>>,
+                            bool,
+                            usize,
+                            usize,
+                            Vec<(i64, String, String, Option<u64>)>,
+                        )| {
+                            if let Some(ref conv) = conversation {
+                                v.set_conversation(conv);
+                            } else if let Some(body) = body {
+                                if let Some(ref html) = body.html {
+                                    v.set_body_html(html);
+                                } else {
+                                    v.set_body_text(&body.text);
+                                }
+                            }
+                            if blocked > 0 && !sender_allowed {
+                                v.show_images_banner(blocked);
+                            } else {
+                                v.hide_images_banner();
+                            }
+                            if tracking > 0 {
+                                v.show_tracking_info(tracking);
+                            } else {
+                                v.hide_tracking_info();
+                            }
+                            if !att_data.is_empty() {
+                                if let Some(win) = v.root().and_then(|r| r.downcast::<MqWindow>().ok()) {
+                                    let cb = make_attachment_download_callback(pool_dl4.clone(), db_id, win);
+                                    v.set_attachments(&att_data, cb);
+                                }
+                            } else {
+                                v.hide_attachments();
+                            }
+                        },
+                    );
+                }
+            }
         },
     );
 }
 
 fn db_to_message_data(messages: Vec<mq_db::models::DbMessage>) -> Vec<MessageData> {
-    messages
+    let mut data: Vec<MessageData> = messages
         .into_iter()
         .map(|m| MessageData {
             db_id: m.id,
@@ -880,7 +2297,7 @@ fn db_to_message_data(messages: Vec<mq_db::models::DbMessage>) -> Vec<MessageDat
             sender_name: m.sender_name.unwrap_or_default(),
             sender_email: m.sender_email,
             subject: m.subject.unwrap_or_default(),
-            date: m.date,
+            date: mq_core::email::normalize_date(&m.date),
             snippet: m.snippet.unwrap_or_default(),
             is_read: m.flags.contains("\\Seen"),
             is_flagged: m.flags.contains("\\Flagged"),
@@ -888,10 +2305,48 @@ fn db_to_message_data(messages: Vec<mq_db::models::DbMessage>) -> Vec<MessageDat
             mailbox: m.mailbox,
             account_id: m.account_id,
             recipient_to: m.recipient_to,
+            recipient_cc: m.recipient_cc,
             list_unsubscribe: m.list_unsubscribe,
             list_unsubscribe_post: m.list_unsubscribe_post,
+            gmail_thread_id: m.gmail_thread_id,
+            thread_count: 1,
         })
-        .collect()
+        .collect();
+    data.sort_by(|a, b| b.date.cmp(&a.date));
+    data
+}
+
+fn db_to_threaded_message_data(
+    messages: Vec<(mq_db::models::DbMessage, i64)>,
+) -> Vec<MessageData> {
+    let mut data: Vec<MessageData> = messages
+        .into_iter()
+        .map(|(m, count)| MessageData {
+            db_id: m.id,
+            uid: m.uid as u32,
+            sender_name: m.sender_name.unwrap_or_default(),
+            sender_email: m.sender_email,
+            subject: m.subject.unwrap_or_default(),
+            // Normalize date on read so old RFC 2822 entries sort correctly
+            date: mq_core::email::normalize_date(&m.date),
+            snippet: m.snippet.unwrap_or_default(),
+            is_read: m.flags.contains("\\Seen"),
+            is_flagged: m.flags.contains("\\Flagged"),
+            has_attachments: m.has_attachments,
+            mailbox: m.mailbox,
+            account_id: m.account_id,
+            recipient_to: m.recipient_to,
+            recipient_cc: m.recipient_cc,
+            list_unsubscribe: m.list_unsubscribe,
+            list_unsubscribe_post: m.list_unsubscribe_post,
+            gmail_thread_id: m.gmail_thread_id,
+            thread_count: count,
+        })
+        .collect();
+    // Sort by normalized date (newest first) since DB ORDER BY may be wrong
+    // for un-normalized RFC 2822 dates
+    data.sort_by(|a, b| b.date.cmp(&a.date));
+    data
 }
 
 fn make_message_objects(
@@ -924,6 +2379,8 @@ fn make_message_objects(
                 &m.mailbox,
                 m.account_id,
                 &badge,
+                m.gmail_thread_id.unwrap_or(0),
+                m.thread_count,
             )
         })
         .collect()
@@ -933,7 +2390,7 @@ fn make_message_objects(
 // Message selection & actions
 // ---------------------------------------------------------------------------
 
-fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>) {
+fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_messages: &Rc<RefCell<Vec<MessageData>>>) {
     let pool2 = pool.clone();
     let ml2 = window.message_list();
     window
@@ -941,11 +2398,25 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>) {
         .connect_star_toggled(move |starred| {
             if let Some(msg) = selected_message(&ml2) {
                 let db_id = msg.db_id();
+                let uid = msg.uid();
+                let account_id = msg.account_id();
+                let mailbox = msg.mailbox();
                 let pool = pool2.clone();
                 msg.set_is_flagged(starred);
                 debug!(db_id, starred, "Star toggled");
+                let pool_imap = pool.clone();
                 runtime::spawn_async(
                     async move { toggle_flag(&pool, db_id, "\\Flagged", starred).await },
+                    |_| {},
+                );
+                runtime::spawn_async(
+                    async move {
+                        if let Err(e) = imap_store_flag(
+                            &pool_imap, account_id, &mailbox, uid, "\\Flagged", starred,
+                        ).await {
+                            warn!("Failed to sync star flag to server: {e}");
+                        }
+                    },
                     |_| {},
                 );
             }
@@ -956,11 +2427,25 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>) {
     window.message_view().connect_read_toggled(move |read| {
         if let Some(msg) = selected_message(&ml3) {
             let db_id = msg.db_id();
+            let uid = msg.uid();
+            let account_id = msg.account_id();
+            let mailbox = msg.mailbox();
             let pool = pool3.clone();
             msg.set_is_read(read);
             debug!(db_id, read, "Read toggled");
+            let pool_imap = pool.clone();
             runtime::spawn_async(
                 async move { toggle_flag(&pool, db_id, "\\Seen", read).await },
+                |_| {},
+            );
+            runtime::spawn_async(
+                async move {
+                    if let Err(e) = imap_store_flag(
+                        &pool_imap, account_id, &mailbox, uid, "\\Seen", read,
+                    ).await {
+                        warn!("Failed to sync read flag to server: {e}");
+                    }
+                },
                 |_| {},
             );
         }
@@ -969,33 +2454,86 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>) {
     let pool4 = pool.clone();
     let ml4 = window.message_list();
     let view4 = window.message_view();
+    let del_win = window.clone();
+    let del_msgs = shared_messages.clone();
     window.message_view().connect_delete_clicked(move || {
         if let Some(msg) = selected_message(&ml4) {
             let db_id = msg.db_id();
+            let uid = msg.uid();
+            let account_id = msg.account_id();
+            let mailbox = msg.mailbox();
             let pool = pool4.clone();
             debug!(db_id, "Delete clicked");
+            let has_remaining = ml4.model().n_items() > 1;
             remove_selected(&ml4);
-            view4.show_placeholder();
+            if !has_remaining {
+                view4.show_placeholder();
+            }
+            // The selection model auto-selects the next message,
+            // which fires connect_message_selected to load it.
+            let sync_pool = pool.clone();
+            let sync_win = del_win.clone();
+            let sync_msgs = del_msgs.clone();
             runtime::spawn_async(
                 async move {
+                    // Move to trash on IMAP server
+                    if let Err(e) = imap_trash_message(&pool, account_id, &mailbox, uid).await {
+                        warn!("Failed to trash message on server: {e}");
+                    }
+                    // Remove from local DB
                     if let Err(e) =
                         mq_db::queries::messages::delete_message(&pool, db_id).await
                     {
-                        warn!("Failed to delete message: {e}");
+                        warn!("Failed to delete message locally: {e}");
                     }
+                    account_id
                 },
-                |_| {},
+                move |account_id: i64| {
+                    trigger_sync_account(account_id, &sync_pool, &sync_win, &sync_msgs);
+                },
             );
         }
     });
 
+    let pool5 = pool.clone();
     let ml5 = window.message_list();
     let view5 = window.message_view();
+    let arch_win = window.clone();
+    let arch_msgs = shared_messages.clone();
     window.message_view().connect_archive_clicked(move || {
         if let Some(msg) = selected_message(&ml5) {
-            debug!(db_id = msg.db_id(), "Archive clicked");
+            let db_id = msg.db_id();
+            let uid = msg.uid();
+            let account_id = msg.account_id();
+            let mailbox = msg.mailbox();
+            let pool = pool5.clone();
+            debug!(db_id, "Archive clicked");
+            let has_remaining = ml5.model().n_items() > 1;
             remove_selected(&ml5);
-            view5.show_placeholder();
+            if !has_remaining {
+                view5.show_placeholder();
+            }
+            let sync_pool = pool.clone();
+            let sync_win = arch_win.clone();
+            let sync_msgs = arch_msgs.clone();
+            runtime::spawn_async(
+                async move {
+                    // Move to All Mail on IMAP server (Gmail archive)
+                    if let Err(e) = imap_archive_message(&pool, account_id, &mailbox, uid).await {
+                        warn!("Failed to archive message on server: {e}");
+                    }
+                    // Remove from local DB (will be re-fetched on sync as All Mail)
+                    if let Err(e) =
+                        mq_db::queries::messages::delete_message(&pool, db_id).await
+                    {
+                        warn!("Failed to delete archived message locally: {e}");
+                    }
+                    account_id
+                },
+                move |account_id: i64| {
+                    trigger_sync_account(account_id, &sync_pool, &sync_win, &sync_msgs);
+                },
+            );
         }
     });
 }
@@ -1019,8 +2557,9 @@ fn wire_compose_buttons(
     {
         let w = window.clone();
         let accts = account_tuples.clone();
+        let pool = pool.clone();
         window.message_list().connect_compose_clicked(move || {
-            open_compose(&w, &accts, ComposeMode::New, None);
+            open_compose(&w, &accts, ComposeMode::New, None, &pool);
         });
     }
 
@@ -1030,6 +2569,7 @@ fn wire_compose_buttons(
         let ml = window.message_list();
         let accts = account_tuples.clone();
         let pool = pool.clone();
+        let sm = shared_messages.clone();
         window.message_view().connect_reply_clicked(move || {
             if let Some(msg) = selected_message(&ml) {
                 let db_id = msg.db_id();
@@ -1040,6 +2580,8 @@ fn wire_compose_buttons(
                 let accts = accts.clone();
                 let w = w.clone();
                 let pool = pool.clone();
+                let pool2 = pool.clone();
+                let sm = sm.clone();
                 runtime::spawn_async(
                     async move { load_message_body_text(&pool, db_id).await },
                     move |body: Option<String>| {
@@ -1052,7 +2594,7 @@ fn wire_compose_buttons(
                             message_id: None,
                             references: None,
                         };
-                        open_compose(&w, &accts, mode, Some(account_id));
+                        open_compose_with_refresh(&w, &accts, mode, Some(account_id), &pool2, sm);
                     },
                 );
             }
@@ -1065,6 +2607,7 @@ fn wire_compose_buttons(
         let ml = window.message_list();
         let accts = account_tuples.clone();
         let msgs = shared_messages.clone();
+        let sm2 = shared_messages.clone();
         let pool = pool.clone();
         window.message_view().connect_reply_all_clicked(move || {
             if let Some(msg) = selected_message(&ml) {
@@ -1080,10 +2623,18 @@ fn wire_compose_buttons(
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
+                let cc_str = msg_data.and_then(|m| m.recipient_cc.clone()).unwrap_or_default();
+                let cc_addrs: Vec<String> = cc_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 let account_id = msg.account_id();
                 let accts = accts.clone();
                 let w = w.clone();
                 let pool = pool.clone();
+                let pool2 = pool.clone();
+                let sm = sm2.clone();
                 runtime::spawn_async(
                     async move { load_message_body_text(&pool, db_id).await },
                     move |body: Option<String>| {
@@ -1091,14 +2642,14 @@ fn wire_compose_buttons(
                         let mode = ComposeMode::ReplyAll {
                             from: from.clone(),
                             to: to_addrs,
-                            cc: vec![],
+                            cc: cc_addrs,
                             subject: subject.clone(),
                             date: date.clone(),
                             body: body_text,
                             message_id: None,
                             references: None,
                         };
-                        open_compose(&w, &accts, mode, Some(account_id));
+                        open_compose_with_refresh(&w, &accts, mode, Some(account_id), &pool2, sm);
                     },
                 );
             }
@@ -1111,6 +2662,7 @@ fn wire_compose_buttons(
         let ml = window.message_list();
         let accts = account_tuples.clone();
         let msgs = shared_messages.clone();
+        let sm3 = shared_messages.clone();
         let pool = pool.clone();
         window.message_view().connect_forward_clicked(move || {
             if let Some(msg) = selected_message(&ml) {
@@ -1125,6 +2677,8 @@ fn wire_compose_buttons(
                 let accts = accts.clone();
                 let w = w.clone();
                 let pool = pool.clone();
+                let pool2 = pool.clone();
+                let sm = sm3.clone();
                 runtime::spawn_async(
                     async move { load_message_body_text(&pool, db_id).await },
                     move |body: Option<String>| {
@@ -1136,7 +2690,7 @@ fn wire_compose_buttons(
                             to,
                             body: body_text,
                         };
-                        open_compose(&w, &accts, mode, Some(account_id));
+                        open_compose_with_refresh(&w, &accts, mode, Some(account_id), &pool2, sm);
                     },
                 );
             }
@@ -1149,6 +2703,29 @@ fn open_compose(
     accounts: &[(i64, String)],
     mode: ComposeMode,
     selected_account_id: Option<i64>,
+    pool: &Arc<SqlitePool>,
+) {
+    open_compose_impl(window, accounts, mode, selected_account_id, pool, None);
+}
+
+fn open_compose_with_refresh(
+    window: &MqWindow,
+    accounts: &[(i64, String)],
+    mode: ComposeMode,
+    selected_account_id: Option<i64>,
+    pool: &Arc<SqlitePool>,
+    shared_messages: Rc<RefCell<Vec<MessageData>>>,
+) {
+    open_compose_impl(window, accounts, mode, selected_account_id, pool, Some(shared_messages));
+}
+
+fn open_compose_impl(
+    window: &MqWindow,
+    accounts: &[(i64, String)],
+    mode: ComposeMode,
+    selected_account_id: Option<i64>,
+    pool: &Arc<SqlitePool>,
+    shared_messages: Option<Rc<RefCell<Vec<MessageData>>>>,
 ) {
     let config = mq_core::config::AppConfig::load().unwrap_or_default();
     let signature = config.compose.default_signature;
@@ -1158,14 +2735,45 @@ fn open_compose(
     if let Some(aid) = selected_account_id {
         compose.select_account(aid);
     }
+
+    // Load contacts for autocomplete
+    let compose_for_contacts = compose.clone();
+    let pool_for_contacts = pool.clone();
+    let account_ids: Vec<i64> = accounts.iter().map(|(id, _)| *id).collect();
+    runtime::spawn_async(
+        async move {
+            let mut all_contacts = Vec::new();
+            for account_id in &account_ids {
+                if let Ok(contacts) = mq_db::queries::contacts::get_all_for_account(
+                    &pool_for_contacts, *account_id,
+                ).await {
+                    for c in contacts {
+                        all_contacts.push(ContactEntry {
+                            display_name: c.display_name,
+                            email: c.email,
+                        });
+                    }
+                }
+            }
+            all_contacts
+        },
+        move |contacts: Vec<ContactEntry>| {
+            compose_for_contacts.set_contacts(contacts);
+        },
+    );
+
     compose.apply_mode(&mode, &signature);
 
     let (in_reply_to, references) = MqComposeWindow::reply_headers(&mode);
 
     // Wire Send button
     let compose_ref = compose.clone();
+    // Capture refresh context (available when opened with open_compose_with_refresh)
+    let refresh_window: Option<MqWindow> = shared_messages.as_ref().map(|_| window.clone());
+    let refresh_pool_ref: Option<Arc<SqlitePool>> = shared_messages.as_ref().map(|_| pool.clone());
+    let refresh_shared: Option<Rc<RefCell<Vec<MessageData>>>> = shared_messages.clone();
     compose.connect_send(move || {
-        let Some((_, from_email)) = compose_ref.selected_account() else {
+        let Some((send_account_id, from_email)) = compose_ref.selected_account() else {
             warn!("No account selected for sending");
             return;
         };
@@ -1175,6 +2783,19 @@ fn open_compose(
             warn!("No recipients specified");
             return;
         }
+
+        // Read attachment files
+        let attachments: Vec<(String, String, Vec<u8>)> = compose_ref
+            .attachments()
+            .iter()
+            .filter_map(|(filename, path)| {
+                let data = std::fs::read(path).ok()?;
+                let mime = mime_guess::from_path(path)
+                    .first_or_octet_stream()
+                    .to_string();
+                Some((filename.clone(), mime, data))
+            })
+            .collect();
 
         let email = mq_core::smtp::OutgoingEmail {
             from_email: from_email.clone(),
@@ -1187,31 +2808,65 @@ fn open_compose(
             body_html: None,
             in_reply_to: in_reply_to.clone(),
             references: references.clone(),
+            attachments,
         };
 
         info!(to = ?email.to, subject = %email.subject, "Sending email");
 
-        // TODO: Get access token from keyring (Phase 6).
-        // For now, log a placeholder message.
+        // Enter sending state — grey out everything, show progress
+        compose_ref.set_sending(true);
+
         let compose_close = compose_ref.clone();
+        let refresh_win = refresh_window.clone();
+        let refresh_pool = refresh_pool_ref.clone();
+        let refresh_msgs = refresh_shared.clone();
         runtime::spawn_async(
             async move {
-                // When token storage is implemented, this will call:
-                // mq_core::smtp::send_email(&email, &access_token).await
-                warn!(
-                    "SMTP send deferred: token storage not yet implemented. \
-                     Would send to {:?} with subject '{}'",
-                    email.to, email.subject
-                );
-                Ok::<(), String>(())
+                // Get access token from keyring
+                let access_token = match mq_core::keyring::get_tokens(&from_email).await {
+                    Ok(Some(tokens)) => tokens.access_token,
+                    Ok(None) => {
+                        // No stored token — try a refresh in case we have a refresh token
+                        mq_core::keyring::refresh_and_store(&from_email)
+                            .await
+                            .map_err(|e| format!("No access token for {from_email}: {e}"))?
+                    }
+                    Err(e) => return Err(format!("Failed to read keyring: {e}")),
+                };
+
+                // Try sending with the current access token
+                match mq_core::smtp::send_email(&email, &access_token).await {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.is_auth_failure() => {
+                        // Token may be expired — refresh and retry once
+                        info!("Auth failure, refreshing token and retrying");
+                        let new_token = mq_core::keyring::refresh_and_store(&from_email)
+                            .await
+                            .map_err(|e| format!("Token refresh failed: {e}"))?;
+                        mq_core::smtp::send_email(&email, &new_token)
+                            .await
+                            .map_err(|e| format!("Send failed after token refresh: {e}"))
+                    }
+                    Err(e) => Err(format!("Failed to send email: {e}")),
+                }
             },
             move |result: Result<(), String>| match result {
                 Ok(()) => {
-                    info!("Compose window closing (send queued)");
+                    info!("Email sent successfully, closing compose window");
                     compose_close.close();
+                    // Refresh the message list + thread view to show the sent reply
+                    if let (Some(win), Some(pool), Some(msgs)) =
+                        (refresh_win.as_ref(), refresh_pool.as_ref(), refresh_msgs.as_ref())
+                    {
+                        refresh_and_reload_selected(win, pool, msgs);
+                        // Trigger a full IMAP sync so the sent message appears in local cache
+                        trigger_sync_account(send_account_id, pool, win, msgs);
+                    }
                 }
                 Err(e) => {
                     error!("Failed to send: {e}");
+                    // Restore compose window so user can retry
+                    compose_close.set_sending(false);
                 }
             },
         );
@@ -1328,19 +2983,43 @@ fn wire_privacy_buttons(
         let pool = pool.clone();
         let v = view.clone();
         view.connect_load_images(move || {
+            v.set_images_force_loaded();
             if let Some(msg) = selected_message(&ml) {
                 let db_id = msg.db_id();
+                let thread_id = msg.gmail_thread_id();
+                let thread_count = msg.thread_count();
                 let pool = pool.clone();
                 let v = v.clone();
-                runtime::spawn_async(
-                    async move { load_message_body_unblocked(&pool, db_id).await },
-                    move |body: Option<BodyResult>| {
-                        if let Some(body) = body {
-                            v.set_body_text(&body.text);
+
+                if thread_count > 1 && thread_id != 0 {
+                    // Thread view — reload entire conversation unblocked
+                    runtime::spawn_async(
+                        async move {
+                            load_conversation_unblocked(&pool, thread_id).await
+                        },
+                        move |conversation: Vec<(String, String, String, String, bool)>| {
+                            if !conversation.is_empty() {
+                                v.set_conversation(&conversation);
+                            }
                             v.hide_images_banner();
-                        }
-                    },
-                );
+                        },
+                    );
+                } else {
+                    // Single message
+                    runtime::spawn_async(
+                        async move { load_message_body_unblocked(&pool, db_id).await },
+                        move |body: Option<BodyResult>| {
+                            if let Some(body) = body {
+                                if let Some(ref html) = body.html {
+                                    v.set_body_html(html);
+                                } else {
+                                    v.set_body_text(&body.text);
+                                }
+                                v.hide_images_banner();
+                            }
+                        },
+                    );
+                }
             }
         });
     }
@@ -1351,34 +3030,55 @@ fn wire_privacy_buttons(
         let pool = pool.clone();
         let v = view.clone();
         view.connect_always_load_images(move || {
+            v.set_images_force_loaded();
             if let Some(msg) = selected_message(&ml) {
                 let db_id = msg.db_id();
                 let sender_email = msg.sender_email();
                 let account_id = msg.account_id();
+                let thread_id = msg.gmail_thread_id();
+                let thread_count = msg.thread_count();
                 let pool = pool.clone();
                 let v = v.clone();
-                runtime::spawn_async(
-                    async move {
-                        // Add to allowlist
-                        if let Err(e) = mq_db::queries::sender_allowlist::add_sender(
-                            &pool,
-                            account_id,
-                            &sender_email,
-                        )
-                        .await
-                        {
-                            warn!("Failed to add sender to allowlist: {e}");
-                        }
-                        // Reload body unblocked
-                        load_message_body_unblocked(&pool, db_id).await
-                    },
-                    move |body: Option<BodyResult>| {
-                        if let Some(body) = body {
-                            v.set_body_text(&body.text);
+
+                if thread_count > 1 && thread_id != 0 {
+                    runtime::spawn_async(
+                        async move {
+                            if let Err(e) = mq_db::queries::sender_allowlist::add_sender(
+                                &pool, account_id, &sender_email,
+                            ).await {
+                                warn!("Failed to add sender to allowlist: {e}");
+                            }
+                            load_conversation_unblocked(&pool, thread_id).await
+                        },
+                        move |conversation: Vec<(String, String, String, String, bool)>| {
+                            if !conversation.is_empty() {
+                                v.set_conversation(&conversation);
+                            }
                             v.hide_images_banner();
-                        }
-                    },
-                );
+                        },
+                    );
+                } else {
+                    runtime::spawn_async(
+                        async move {
+                            if let Err(e) = mq_db::queries::sender_allowlist::add_sender(
+                                &pool, account_id, &sender_email,
+                            ).await {
+                                warn!("Failed to add sender to allowlist: {e}");
+                            }
+                            load_message_body_unblocked(&pool, db_id).await
+                        },
+                        move |body: Option<BodyResult>| {
+                            if let Some(body) = body {
+                                if let Some(ref html) = body.html {
+                                    v.set_body_html(html);
+                                } else {
+                                    v.set_body_text(&body.text);
+                                }
+                                v.hide_images_banner();
+                            }
+                        },
+                    );
+                }
             }
         });
     }
@@ -1619,37 +3319,60 @@ fn format_sender(msg: &MessageObject) -> String {
 
 struct BodyResult {
     text: String,
+    html: Option<String>,
     blocked_images: usize,
     tracking_pixels: usize,
+    /// Whether the original email had an HTML body (used to decide
+    /// whether to show the "load images" banner even when blocked_images == 0,
+    /// since CSS backgrounds and other remote resources aren't counted).
+    is_html: bool,
 }
 
 async fn load_message_body(pool: &SqlitePool, message_id: i64) -> Option<BodyResult> {
     let config = mq_core::config::AppConfig::load().unwrap_or_default();
     match mq_db::queries::message_bodies::get_body(pool, message_id).await {
         Ok(Some(body)) => {
-            if let Some(text) = body.text_body {
-                Some(BodyResult {
-                    text,
-                    blocked_images: 0,
-                    tracking_pixels: 0,
+            let is_html = body.html_body.is_some();
+            // Sanitize HTML: block remote images, detect tracking pixels
+            let (sanitized_html, blocked_images, tracking_pixels) =
+                if let Some(ref html) = body.html_body {
+                    // Resolve CID (inline) images before sanitization
+                    let with_cid = if let Some(ref raw) = body.raw_mime {
+                        mq_core::body::resolve_cid_images(html, raw)
+                    } else {
+                        html.clone()
+                    };
+                    let sanitized = mq_core::privacy::images::sanitize_html(
+                        &with_cid,
+                        config.privacy.block_remote_images,
+                        config.privacy.detect_tracking_pixels,
+                    );
+                    (
+                        Some(sanitized.html),
+                        sanitized.blocked_image_count,
+                        sanitized.tracking_pixel_count,
+                    )
+                } else {
+                    (None, 0, 0)
+                };
+
+            // Plain text fallback (used for snippets, compose, etc.)
+            let text = body
+                .text_body
+                .or_else(|| {
+                    sanitized_html
+                        .as_ref()
+                        .map(|h| mq_core::privacy::images::html_to_plain_text(h))
                 })
-            } else if let Some(html) = body.html_body {
-                // Apply privacy sanitization to HTML
-                let sanitized = mq_core::privacy::images::sanitize_html(
-                    &html,
-                    config.privacy.block_remote_images,
-                    config.privacy.detect_tracking_pixels,
-                );
-                // Convert to plain text for display (no WebKitGTK yet)
-                let text = mq_core::privacy::images::html_to_plain_text(&sanitized.html);
-                Some(BodyResult {
-                    text,
-                    blocked_images: sanitized.blocked_image_count,
-                    tracking_pixels: sanitized.tracking_pixel_count,
-                })
-            } else {
-                None
-            }
+                .unwrap_or_default();
+
+            Some(BodyResult {
+                text,
+                html: sanitized_html,
+                blocked_images,
+                tracking_pixels,
+                is_html,
+            })
         }
         Ok(None) => None,
         Err(e) => {
@@ -1660,32 +3383,47 @@ async fn load_message_body(pool: &SqlitePool, message_id: i64) -> Option<BodyRes
 }
 
 /// Load message body without image blocking (user clicked "Load images").
+/// Downloads remote images and inlines them as data: URIs so that WebKitGTK's
+/// `load_html()` can display them without needing network access.
 async fn load_message_body_unblocked(pool: &SqlitePool, message_id: i64) -> Option<BodyResult> {
     let config = mq_core::config::AppConfig::load().unwrap_or_default();
     match mq_db::queries::message_bodies::get_body(pool, message_id).await {
         Ok(Some(body)) => {
-            if let Some(text) = body.text_body {
-                Some(BodyResult {
-                    text,
-                    blocked_images: 0,
-                    tracking_pixels: 0,
-                })
-            } else if let Some(html) = body.html_body {
-                // Don't block images, but still detect tracking pixels
+            let (sanitized_html, tracking_pixels) = if let Some(ref html) = body.html_body {
+                // Resolve CID (inline) images first
+                let with_cid = if let Some(ref raw) = body.raw_mime {
+                    mq_core::body::resolve_cid_images(html, raw)
+                } else {
+                    html.clone()
+                };
                 let sanitized = mq_core::privacy::images::sanitize_html(
-                    &html,
+                    &with_cid,
                     false, // don't block
                     config.privacy.detect_tracking_pixels,
                 );
-                let text = mq_core::privacy::images::html_to_plain_text(&sanitized.html);
-                Some(BodyResult {
-                    text,
-                    blocked_images: 0,
-                    tracking_pixels: sanitized.tracking_pixel_count,
-                })
+                // Download remote images and inline as data: URIs
+                let inlined = inline_remote_images(&sanitized.html).await;
+                (Some(inlined), sanitized.tracking_pixel_count)
             } else {
-                None
-            }
+                (None, 0)
+            };
+
+            let text = body
+                .text_body
+                .or_else(|| {
+                    sanitized_html
+                        .as_ref()
+                        .map(|h| mq_core::privacy::images::html_to_plain_text(h))
+                })
+                .unwrap_or_default();
+
+            Some(BodyResult {
+                text,
+                html: sanitized_html,
+                blocked_images: 0,
+                tracking_pixels,
+                is_html: body.html_body.is_some(),
+            })
         }
         Ok(None) => None,
         Err(e) => {
@@ -1693,6 +3431,233 @@ async fn load_message_body_unblocked(pool: &SqlitePool, message_id: i64) -> Opti
             None
         }
     }
+}
+
+/// Download remote images referenced in HTML and replace their `src` attributes
+/// with inline `data:` URIs. This allows WebKitGTK's `load_html()` to display
+/// images without requiring network access from the WebView.
+async fn inline_remote_images(html: &str) -> String {
+    use base64::Engine;
+
+    // Extract all <img src="https://..."> URLs
+    let mut urls: Vec<(usize, usize, String)> = Vec::new();
+    let lower = html.to_lowercase();
+    let mut search_from = 0;
+    while let Some(img_pos) = lower[search_from..].find("<img") {
+        let abs_pos = search_from + img_pos;
+        if let Some(tag_end) = html[abs_pos..].find('>') {
+            let tag = &html[abs_pos..abs_pos + tag_end + 1];
+            if let Some(src) = extract_img_src(tag) {
+                if src.starts_with("http://") || src.starts_with("https://") {
+                    // Record the tag boundaries and URL
+                    urls.push((abs_pos, abs_pos + tag_end + 1, src));
+                }
+            }
+            search_from = abs_pos + tag_end + 1;
+        } else {
+            break;
+        }
+    }
+
+    if urls.is_empty() {
+        return html.to_string();
+    }
+
+    // Download images concurrently (with timeout)
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("Mozilla/5.0")
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+
+    for (tag_start, tag_end, url) in &urls {
+        match client.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let content_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("image/png")
+                    .split(';')
+                    .next()
+                    .unwrap_or("image/png")
+                    .to_string();
+
+                if let Ok(bytes) = resp.bytes().await {
+                    // Limit to 5MB per image
+                    if bytes.len() < 5_000_000 {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        let data_uri = format!("data:{content_type};base64,{b64}");
+                        // Replace src="<url>" with src="<data_uri>" in the tag
+                        let tag = &html[*tag_start..*tag_end];
+                        let new_tag = replace_src_in_tag(tag, &data_uri);
+                        replacements.push((*tag_start, *tag_end, new_tag));
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+
+    if replacements.is_empty() {
+        return html.to_string();
+    }
+
+    // Build result with replacements applied in reverse order
+    let mut result = html.to_string();
+    for (start, end, new_tag) in replacements.into_iter().rev() {
+        result.replace_range(start..end, &new_tag);
+    }
+
+    result
+}
+
+/// Extract the `src` attribute value from an `<img>` tag.
+fn extract_img_src(tag: &str) -> Option<String> {
+    let lower = tag.to_lowercase();
+    let src_pos = lower.find("src=")?;
+    let after_eq = src_pos + 4;
+    let bytes = tag.as_bytes();
+    if after_eq >= bytes.len() {
+        return None;
+    }
+    let quote = bytes[after_eq] as char;
+    if quote == '"' || quote == '\'' {
+        let value_start = after_eq + 1;
+        let value_end = tag[value_start..].find(quote)?;
+        Some(tag[value_start..value_start + value_end].to_string())
+    } else {
+        let value_start = after_eq;
+        let value_end = tag[value_start..]
+            .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .unwrap_or(tag.len() - value_start);
+        Some(tag[value_start..value_start + value_end].to_string())
+    }
+}
+
+/// Replace the `src` attribute in an `<img>` tag with a new value.
+fn replace_src_in_tag(tag: &str, new_src: &str) -> String {
+    let lower = tag.to_lowercase();
+    if let Some(src_pos) = lower.find("src=") {
+        let after_eq = src_pos + 4;
+        let bytes = tag.as_bytes();
+        if after_eq < bytes.len() {
+            let quote = bytes[after_eq] as char;
+            if quote == '"' || quote == '\'' {
+                let value_start = after_eq + 1;
+                if let Some(value_end) = tag[value_start..].find(quote) {
+                    let end = value_start + value_end;
+                    return format!("{}{new_src}{}", &tag[..value_start], &tag[end..]);
+                }
+            }
+        }
+    }
+    tag.to_string()
+}
+
+/// Create an attachment download callback that extracts content from raw MIME and saves to file.
+fn make_attachment_download_callback(
+    pool: Arc<SqlitePool>,
+    message_id: i64,
+    window: MqWindow,
+) -> impl Fn(i64, String) + Clone + 'static {
+    move |_att_id: i64, filename: String| {
+        let pool = pool.clone();
+        let win = window.clone();
+        // Look up the attachment's imap_section from the DB, then extract from raw MIME
+        runtime::spawn_async(
+            async move {
+                let attachments =
+                    mq_db::queries::attachments::get_attachments(&pool, message_id)
+                        .await
+                        .unwrap_or_default();
+                let att = attachments.iter().find(|a| a.id == _att_id);
+                if let Some(att) = att {
+                    let section_idx: usize =
+                        att.imap_section.parse().unwrap_or(0);
+                    let body =
+                        mq_db::queries::message_bodies::get_body(&pool, message_id)
+                            .await
+                            .ok()
+                            .flatten();
+                    if let Some(body) = body {
+                        if let Some(raw) = body.raw_mime {
+                            let content =
+                                mq_core::body::extract_attachment_content(&raw, section_idx);
+                            return (content, filename.clone());
+                        }
+                    }
+                }
+                (None, filename.clone())
+            },
+            move |(content, filename): (Option<Vec<u8>>, String)| {
+                if let Some(data) = content {
+                    // Use GTK file dialog to let user pick save location
+                    let dialog = gtk::FileDialog::builder()
+                        .title("Save Attachment")
+                        .initial_name(&filename)
+                        .build();
+                    let data = std::rc::Rc::new(data);
+                    dialog.save(
+                        Some(&win.upcast_ref::<gtk::Window>().clone()),
+                        Option::<&gio::Cancellable>::None,
+                        move |result: Result<gio::File, glib::Error>| {
+                            if let Ok(file) = result {
+                                if let Some(path) = file.path() {
+                                    if let Err(e) = std::fs::write(path.as_path(), data.as_slice()) {
+                                        error!("Failed to save attachment: {e}");
+                                    } else {
+                                        info!("Saved attachment to {}", path.display());
+                                    }
+                                }
+                            }
+                        },
+                    );
+                } else {
+                    warn!("Could not extract attachment content for: {filename}");
+                }
+            },
+        );
+    }
+}
+
+/// Load all messages in a thread with images unblocked (user clicked "Load images").
+/// Returns `(from, date, html, text)` tuples for `set_conversation`.
+async fn load_conversation_unblocked(
+    pool: &SqlitePool,
+    thread_id: i64,
+) -> Vec<(String, String, String, String, bool)> {
+    let thread_msgs = mq_db::queries::messages::get_thread_messages(pool, thread_id)
+        .await
+        .unwrap_or_default();
+
+    let mut conversation = Vec::new();
+    for tmsg in &thread_msgs {
+        let from_display = tmsg
+            .sender_name
+            .as_deref()
+            .filter(|n| !n.is_empty())
+            .map(|n| format!("{n} <{}>", tmsg.sender_email))
+            .unwrap_or_else(|| tmsg.sender_email.clone());
+
+        let body = load_message_body_unblocked(pool, tmsg.id).await;
+        let body_html = body
+            .as_ref()
+            .and_then(|b| b.html.clone())
+            .unwrap_or_default();
+        let body_text = body
+            .as_ref()
+            .map(|b| b.text.clone())
+            .unwrap_or_else(|| tmsg.snippet.clone().unwrap_or_default());
+
+        let is_read = tmsg.flags.contains("\\Seen");
+        conversation.push((from_display, tmsg.date.clone(), body_html, body_text, is_read));
+    }
+    conversation
 }
 
 /// Load message body as plain text (for compose reply/forward — no privacy counters needed).
@@ -1750,6 +3715,94 @@ async fn toggle_flag(pool: &SqlitePool, message_id: i64, flag: &str, add: bool) 
     }
 }
 
+/// Store (add/remove) a flag on the IMAP server.
+async fn imap_store_flag(
+    pool: &SqlitePool,
+    account_id: i64,
+    mailbox: &str,
+    uid: u32,
+    flag: &str,
+    add: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use mq_core::imap::client::ImapSession;
+
+    let accounts = mq_db::queries::accounts::get_all_accounts(pool).await?;
+    let account = accounts
+        .iter()
+        .find(|a| a.id == account_id)
+        .ok_or("Account not found")?;
+    let email = &account.email;
+
+    let tokens = mq_core::keyring::get_tokens(email)
+        .await?
+        .ok_or("No tokens found for account")?;
+    let token = tokens.access_token;
+
+    let mut session = ImapSession::connect(email, &token).await?;
+    session.select(mailbox).await?;
+    session.store_flags(uid, flag, add).await?;
+    let _ = session.logout().await;
+    Ok(())
+}
+
+/// Move a message to Gmail Trash via IMAP.
+async fn imap_archive_message(
+    pool: &SqlitePool,
+    account_id: i64,
+    mailbox: &str,
+    uid: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use mq_core::imap::client::ImapSession;
+
+    let accounts = mq_db::queries::accounts::get_all_accounts(pool).await?;
+    let account = accounts
+        .iter()
+        .find(|a| a.id == account_id)
+        .ok_or("Account not found")?;
+    let email = &account.email;
+
+    let tokens = mq_core::keyring::get_tokens(email)
+        .await?
+        .ok_or("No tokens found for account")?;
+    let token = tokens.access_token;
+
+    let mut session = ImapSession::connect(email, &token).await?;
+    session.select(mailbox).await?;
+    session.move_message(uid, "[Gmail]/All Mail").await?;
+    let _ = session.logout().await;
+    Ok(())
+}
+
+async fn imap_trash_message(
+    pool: &SqlitePool,
+    account_id: i64,
+    mailbox: &str,
+    uid: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use mq_core::imap::client::ImapSession;
+
+    // Look up account email
+    let accounts = mq_db::queries::accounts::get_all_accounts(pool).await?;
+    let account = accounts
+        .iter()
+        .find(|a| a.id == account_id)
+        .ok_or("Account not found")?;
+    let email = &account.email;
+
+    // Get access token from keyring
+    let tokens = mq_core::keyring::get_tokens(email)
+        .await?
+        .ok_or("No tokens found for account")?;
+    let token = tokens.access_token;
+
+    // Connect and move to trash
+    let mut session = ImapSession::connect(email, &token).await?;
+    session.select(mailbox).await?;
+    session.move_message(uid, "[Gmail]/Trash").await?;
+    let _ = session.logout().await;
+    Ok(())
+}
+
 fn selected_message(
     list: &crate::widgets::message_list::MqMessageList,
 ) -> Option<MessageObject> {
@@ -1758,12 +3811,43 @@ fn selected_message(
         .and_then(|item| item.downcast::<MessageObject>().ok())
 }
 
+/// Remove the selected message from the list and trigger a selection change
+/// so that the message view loads the newly selected item.
+///
+/// GTK4's SingleSelection with `autoselect=true` silently re-selects after a
+/// model removal, which can suppress the `selection-changed` signal (the
+/// position index stays the same even though the item changed). We work
+/// around this by: disabling autoselect → deselecting → removing → then
+/// re-selecting in an idle callback so GTK sees a genuine position change.
 fn remove_selected(list: &crate::widgets::message_list::MqMessageList) {
     let selection = list.selection();
     let pos = selection.selected();
     let model = list.model();
-    if pos < model.n_items() {
-        model.remove(pos);
+    if pos >= model.n_items() {
+        return;
+    }
+
+    // Disable autoselect so GTK doesn't silently re-select after removal
+    selection.set_autoselect(false);
+    // Deselect first — this fires selection-changed with no item (handler no-ops)
+    selection.set_selected(gtk::INVALID_LIST_POSITION);
+    // Now remove the item from the model
+    model.remove(pos);
+
+    let new_pos = if model.n_items() == 0 {
+        gtk::INVALID_LIST_POSITION
+    } else {
+        pos.min(model.n_items() - 1)
+    };
+
+    if new_pos != gtk::INVALID_LIST_POSITION {
+        let sel = selection.clone();
+        glib::idle_add_local_once(move || {
+            sel.set_autoselect(true);
+            sel.set_selected(new_pos);
+        });
+    } else {
+        selection.set_autoselect(true);
     }
 }
 
@@ -1811,8 +3895,14 @@ fn register_bundled_icons() {
 
 fn load_css() {
     let provider = gtk::CssProvider::new();
-    provider.load_from_data(
+    provider.load_from_string(
         "
+        /* Prevent the read/unread toggle from showing GTK's checked highlight. */
+        .read-toggle:checked {
+            background: transparent;
+            color: inherit;
+        }
+
         .bold-label {
             font-weight: bold;
         }
@@ -1844,3 +3934,4 @@ fn load_css() {
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 }
+

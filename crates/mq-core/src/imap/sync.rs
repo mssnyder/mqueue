@@ -204,7 +204,14 @@ async fn fetch_new_messages(
         }
     }
 
-    debug!(count = messages.len(), uid_range, "Fetched new messages");
+    let with_thread_ids = messages.iter().filter(|m| m.gmail_thread_id.is_some()).count();
+    debug!(
+        count = messages.len(),
+        with_thread_ids,
+        uid_range,
+        "Fetched new messages"
+    );
+
     Ok(messages)
 }
 

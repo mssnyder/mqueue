@@ -41,6 +41,17 @@ pub async fn upsert_body(
     Ok(())
 }
 
+/// Check if a body already exists for a message (avoids re-fetching).
+pub async fn has_body(pool: &SqlitePool, message_id: i64) -> sqlx::Result<bool> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM message_bodies WHERE message_id = ?",
+    )
+    .bind(message_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0 > 0)
+}
+
 pub async fn delete_body(pool: &SqlitePool, message_id: i64) -> sqlx::Result<()> {
     sqlx::query("DELETE FROM message_bodies WHERE message_id = ?")
         .bind(message_id)

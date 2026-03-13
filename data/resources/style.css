@@ -1,3 +1,10 @@
+/* Prevent the read/unread toggle from showing GTK's "checked" highlight.
+   The button acts as a toggle but should always look flat like other header buttons. */
+.read-toggle:checked {
+    background: transparent;
+    color: inherit;
+}
+
 .bold-label {
     font-weight: bold;
 }

@@ -130,11 +130,18 @@
             gtk4.dev
             libadwaita.dev
 
+            # GIO modules needed by WebKitGTK at runtime (TLS, etc.)
+            glib-networking
+
             # D-Bus debugging
             dbus
           ];
 
           shellHook = ''
+            # WebKitGTK needs GIO modules at runtime (TLS, etc.).
+            # wrapGAppsHook4 sets these for the built binary, but cargo run
+            # runs unwrapped, so we set them here for development.
+            export GIO_EXTRA_MODULES="${pkgs.glib-networking}/lib/gio/modules''${GIO_EXTRA_MODULES:+:$GIO_EXTRA_MODULES}"
             echo "m'Queue dev shell ready (Rust $(rustc --version)). Run 'cargo build' to build."
           '';
         };

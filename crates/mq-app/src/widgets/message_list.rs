@@ -19,6 +19,9 @@ mod imp {
         pub search_bar: RefCell<Option<gtk::SearchBar>>,
         pub search_entry: RefCell<Option<gtk::SearchEntry>>,
         pub search_button: RefCell<Option<gtk::ToggleButton>>,
+        pub sort_button: RefCell<Option<gtk::MenuButton>>,
+        /// Suppresses selection-changed signals during model refresh.
+        pub refreshing: std::rc::Rc<std::cell::Cell<bool>>,
     }
 
     #[glib::object_subclass]
@@ -55,6 +58,17 @@ mod imp {
                 .tooltip_text("Search")
                 .build();
             header.pack_end(&search_button);
+
+            // Sort order menu button
+            let sort_menu = gio::Menu::new();
+            sort_menu.append(Some("Newest first"), Some("sort.newest"));
+            sort_menu.append(Some("Oldest first"), Some("sort.oldest"));
+            let sort_button = gtk::MenuButton::builder()
+                .icon_name("view-sort-descending-symbolic")
+                .tooltip_text("Sort order")
+                .menu_model(&sort_menu)
+                .build();
+            header.pack_end(&sort_button);
 
             widget.append(&header);
 
@@ -118,6 +132,7 @@ mod imp {
                 .vexpand(true)
                 .build();
 
+
             let scrolled = gtk::ScrolledWindow::builder()
                 .vexpand(true)
                 .hscrollbar_policy(gtk::PolicyType::Never)
@@ -133,6 +148,7 @@ mod imp {
             *self.search_bar.borrow_mut() = Some(search_bar);
             *self.search_entry.borrow_mut() = Some(search_entry);
             *self.search_button.borrow_mut() = Some(search_button);
+            *self.sort_button.borrow_mut() = Some(sort_button);
         }
     }
 
@@ -145,8 +161,8 @@ fn create_message_row() -> gtk::Box {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(4)
-        .margin_top(8)
-        .margin_bottom(8)
+        .margin_top(10)
+        .margin_bottom(10)
         .margin_start(12)
         .margin_end(12)
         .build();
@@ -172,6 +188,14 @@ fn create_message_row() -> gtk::Box {
     sender_label.set_widget_name("sender");
     top_line.append(&sender_label);
 
+    // Thread count badge (hidden for single messages)
+    let thread_count_label = gtk::Label::builder()
+        .css_classes(["dim-label", "caption"])
+        .visible(false)
+        .build();
+    thread_count_label.set_widget_name("thread_count");
+    top_line.append(&thread_count_label);
+
     let date_label = gtk::Label::builder()
         .css_classes(["dim-label"])
         .build();
@@ -180,7 +204,7 @@ fn create_message_row() -> gtk::Box {
 
     row.append(&top_line);
 
-    // Bottom line: subject + snippet
+    // Subject + snippet
     let subject_label = gtk::Label::builder()
         .hexpand(true)
         .xalign(0.0)
@@ -244,6 +268,18 @@ fn bind_message_row(row: &gtk::Box, msg: &MessageObject) {
         }
     }
 
+    // Thread count
+    if let Some(tc) = find_child_by_name(&top_line, "thread_count") {
+        let tc = tc.downcast::<gtk::Label>().unwrap();
+        let count = msg.thread_count();
+        if count > 1 {
+            tc.set_label(&count.to_string());
+            tc.set_visible(true);
+        } else {
+            tc.set_visible(false);
+        }
+    }
+
     // Date
     if let Some(date) = find_child_by_name(&top_line, "date") {
         let date = date.downcast::<gtk::Label>().unwrap();
@@ -302,15 +338,9 @@ fn find_child_by_name(parent: &impl IsA<gtk::Widget>, name: &str) -> Option<gtk:
     None
 }
 
-/// Format a date string for display.
+/// Format a date string for display using the shared formatter.
 fn format_date(date_str: &str) -> String {
-    // For now, just truncate to a reasonable length
-    // TODO: proper relative date formatting (Today, Yesterday, Mon, etc.)
-    if date_str.len() > 16 {
-        date_str[..16].to_string()
-    } else {
-        date_str.to_string()
-    }
+    mq_core::email::format_display_date(date_str)
 }
 
 glib::wrapper! {
@@ -361,12 +391,87 @@ impl MqMessageList {
     }
 
     /// Replace all messages in the list with new data.
+    /// Always selects item 0 (used for initial population).
     pub fn set_messages(&self, messages: Vec<MessageObject>) {
         let model = self.model();
+        let selection = self.selection();
         model.remove_all();
         for msg in messages {
             model.append(&msg);
         }
+        // Force selection of item 0 to trigger selection-changed.
+        // We defer via idle_add_local_once so GTK finishes processing all
+        // model mutations before we poke the selection — this avoids races
+        // where SingleSelection's internal auto-select suppresses our signal.
+        if model.n_items() > 0 {
+            selection.set_selected(gtk::INVALID_LIST_POSITION);
+            let sel = selection.clone();
+            glib::idle_add_local_once(move || {
+                sel.set_selected(0);
+            });
+        }
+    }
+
+    /// Refresh messages without disrupting the user's current selection.
+    ///
+    /// Tries to re-select the same message (by db_id) after the model is
+    /// replaced. Only selects item 0 if nothing was previously selected.
+    pub fn refresh_messages(&self, messages: Vec<MessageObject>) {
+        let model = self.model();
+        let selection = self.selection();
+
+        // Remember the currently selected db_id BEFORE touching the model.
+        let prev_pos = selection.selected();
+        let prev_db_id = if prev_pos != gtk::INVALID_LIST_POSITION {
+            model
+                .item(prev_pos)
+                .and_then(|item| item.downcast::<MessageObject>().ok())
+                .map(|msg| msg.db_id())
+        } else {
+            None
+        };
+
+        // Suppress selection-changed handler while we swap the model contents
+        self.imp().refreshing.set(true);
+
+        model.remove_all();
+        for msg in messages {
+            model.append(&msg);
+        }
+
+        if model.n_items() == 0 {
+            self.imp().refreshing.set(false);
+            return;
+        }
+
+        // Try to re-select the same message (silently — flag still set)
+        if let Some(prev_id) = prev_db_id {
+            for i in 0..model.n_items() {
+                if let Some(item) = model.item(i) {
+                    if let Ok(msg) = item.downcast::<MessageObject>() {
+                        if msg.db_id() == prev_id {
+                            selection.set_selected(i);
+                            self.imp().refreshing.set(false);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // No previous selection or message not found — select first item
+        // This IS a real selection change, so clear the flag before triggering
+        self.imp().refreshing.set(false);
+        selection.set_selected(gtk::INVALID_LIST_POSITION);
+        let sel = selection.clone();
+        glib::idle_add_local_once(move || {
+            sel.set_selected(0);
+        });
+    }
+
+    /// Returns true if the list is currently being refreshed (model swap in progress).
+    pub fn is_refreshing(&self) -> bool {
+        self.imp().refreshing.get()
     }
 
     /// Connect a callback for the Compose button.
@@ -377,9 +482,16 @@ impl MqMessageList {
     }
 
     /// Connect a callback for when a message is selected.
+    ///
+    /// The callback is NOT fired during model refreshes (sync updates) to avoid
+    /// reloading the message view while the user is reading.
     pub fn connect_message_selected<F: Fn(&MessageObject) + 'static>(&self, f: F) {
         let selection = self.selection();
+        let refreshing = std::rc::Rc::clone(&self.imp().refreshing);
         selection.connect_selection_changed(move |sel, _, _| {
+            if refreshing.get() {
+                return;
+            }
             if let Some(item) = sel.selected_item() {
                 if let Ok(msg) = item.downcast::<MessageObject>() {
                     f(&msg);
@@ -411,6 +523,30 @@ impl MqMessageList {
                 f(text);
             });
         }
+    }
+
+    /// Connect a callback for when the sort order changes.
+    ///
+    /// The callback receives `true` for newest-first, `false` for oldest-first.
+    pub fn connect_sort_changed<F: Fn(bool) + 'static>(&self, f: F) {
+        let group = gio::SimpleActionGroup::new();
+        let f = std::rc::Rc::new(f);
+
+        let f_newest = f.clone();
+        let newest_action = gio::SimpleAction::new("newest", None);
+        newest_action.connect_activate(move |_, _| {
+            f_newest(true);
+        });
+        group.add_action(&newest_action);
+
+        let f_oldest = f;
+        let oldest_action = gio::SimpleAction::new("oldest", None);
+        oldest_action.connect_activate(move |_, _| {
+            f_oldest(false);
+        });
+        group.add_action(&oldest_action);
+
+        self.insert_action_group("sort", Some(&group));
     }
 
     /// Programmatically close the search bar.

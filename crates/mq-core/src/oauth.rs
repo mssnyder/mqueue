@@ -12,6 +12,7 @@ use crate::error::{MqError, Result};
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GMAIL_SCOPE: &str = "https://mail.google.com/";
+const CONTACTS_SCOPE: &str = "https://www.googleapis.com/auth/contacts.readonly";
 const OPENID_SCOPE: &str = "openid";
 const EMAIL_SCOPE: &str = "email";
 
@@ -76,6 +77,7 @@ pub fn authorization_url(
     let (auth_url, csrf_token) = client
         .authorize_url(CsrfToken::new_random)
         .add_scope(Scope::new(GMAIL_SCOPE.to_string()))
+        .add_scope(Scope::new(CONTACTS_SCOPE.to_string()))
         .add_scope(Scope::new(OPENID_SCOPE.to_string()))
         .add_scope(Scope::new(EMAIL_SCOPE.to_string()))
         .add_extra_param("access_type", "offline")

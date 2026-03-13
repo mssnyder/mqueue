@@ -10,6 +10,8 @@ use tracing::info;
 
 /// The initial migration SQL.
 const MIGRATION_001: &str = include_str!("migrations/20260312000000_initial.sql");
+/// Add contacts table.
+const MIGRATION_002: &str = include_str!("migrations/20260313000000_add_contacts.sql");
 
 /// Initialize the SQLite database, running migrations if needed.
 pub async fn init_pool(db_path: &Path) -> anyhow::Result<SqlitePool> {
@@ -70,6 +72,27 @@ async fn run_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
             .execute(pool)
             .await?;
         info!("Migration 001_initial applied successfully");
+    }
+
+    // Migration 002: contacts table
+    let row = sqlx::query("SELECT COUNT(*) as cnt FROM _mq_migrations WHERE name = '002_add_contacts'")
+        .fetch_one(pool)
+        .await?;
+    let count: i64 = sqlx::Row::get(&row, "cnt");
+
+    if count == 0 {
+        info!("Applying migration 002_add_contacts");
+        for statement in split_sql_statements(MIGRATION_002) {
+            let trimmed = statement.trim();
+            if !trimmed.is_empty() {
+                sqlx::query(trimmed).execute(pool).await?;
+            }
+        }
+
+        sqlx::query("INSERT INTO _mq_migrations (name) VALUES ('002_add_contacts')")
+            .execute(pool)
+            .await?;
+        info!("Migration 002_add_contacts applied successfully");
     }
 
     Ok(())

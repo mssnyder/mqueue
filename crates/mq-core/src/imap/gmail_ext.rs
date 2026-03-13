@@ -161,6 +161,11 @@ fn parse_gmail_labels(raw: &str) -> Vec<String> {
     parse_label_list(label_str)
 }
 
+/// Parse a space-separated label list, handling quoted strings (public version).
+pub fn parse_label_list_pub(input: &str) -> Vec<String> {
+    parse_label_list(input)
+}
+
 /// Parse a space-separated label list, handling quoted strings.
 ///
 /// Input like: `\Inbox "Work" "Projects/Alpha" Unread`

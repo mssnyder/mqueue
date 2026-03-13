@@ -1,11 +1,20 @@
 //! Compose window for writing and sending emails.
 //!
 //! Supports new messages, replies, reply-all, and forwarding.
+//! Address fields (To/Cc/Bcc) have autocomplete from synced contacts.
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::glib;
 use std::cell::RefCell;
+use std::rc::Rc;
+
+/// A contact for autocomplete: (display_name, email).
+#[derive(Debug, Clone)]
+pub struct ContactEntry {
+    pub display_name: Option<String>,
+    pub email: String,
+}
 
 /// The kind of compose action.
 #[derive(Debug, Clone, Default)]
@@ -53,7 +62,13 @@ mod imp {
         pub send_button: RefCell<Option<gtk::Button>>,
         pub cc_row: RefCell<Option<gtk::Box>>,
         pub bcc_row: RefCell<Option<gtk::Box>>,
+        pub sending_bar: RefCell<Option<gtk::ProgressBar>>,
+        pub form_box: RefCell<Option<gtk::Box>>,
+        pub body_scrolled: RefCell<Option<gtk::ScrolledWindow>>,
+        pub attachments_box: RefCell<Option<gtk::Box>>,
         pub accounts: RefCell<Vec<(i64, String)>>,
+        pub contacts: Rc<RefCell<Vec<ContactEntry>>>,
+        pub attachments: Rc<RefCell<Vec<(String, std::path::PathBuf)>>>,
     }
 
     #[glib::object_subclass]
@@ -91,7 +106,22 @@ mod imp {
                 .build();
             header.pack_end(&cc_toggle);
 
+            // Attach button
+            let attach_button = gtk::Button::builder()
+                .icon_name("mail-attachment-symbolic")
+                .tooltip_text("Attach file")
+                .build();
+            header.pack_end(&attach_button);
+
             main_box.append(&header);
+
+            // Sending progress bar (hidden by default)
+            let sending_bar = gtk::ProgressBar::builder()
+                .pulse_step(0.1)
+                .visible(false)
+                .build();
+            sending_bar.add_css_class("osd");
+            main_box.append(&sending_bar);
 
             // Form fields
             let form = gtk::Box::builder()
@@ -148,6 +178,18 @@ mod imp {
 
             main_box.append(&form);
 
+            // Attachments display area (hidden until files added)
+            let attachments_box = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(2)
+                .margin_start(12)
+                .margin_end(12)
+                .margin_top(4)
+                .margin_bottom(4)
+                .visible(false)
+                .build();
+            main_box.append(&attachments_box);
+
             // Separator
             main_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
@@ -178,6 +220,82 @@ mod imp {
                 bcc_row_clone.set_visible(show);
             });
 
+            // Wire attach button
+            {
+                let window_ref = window.clone();
+                let att_box = attachments_box.clone();
+                let att_list = self.attachments.clone();
+                attach_button.connect_clicked(move |_| {
+                    let dialog = gtk::FileDialog::builder()
+                        .title("Attach File")
+                        .build();
+                    let att_box = att_box.clone();
+                    let att_list = att_list.clone();
+                    let win_ref = window_ref.clone();
+                    dialog.open_multiple(
+                        Some(&win_ref.clone().upcast::<gtk::Window>()),
+                        Option::<&gtk::gio::Cancellable>::None,
+                        move |result: Result<gtk::gio::ListModel, glib::Error>| {
+                            if let Ok(files) = result {
+                                for i in 0..files.n_items() {
+                                    if let Some(file) = files.item(i).and_then(|o| o.downcast::<gtk::gio::File>().ok()) {
+                                        if let Some(path) = file.path() {
+                                            let filename = path.file_name()
+                                                .map(|n: &std::ffi::OsStr| n.to_string_lossy().to_string())
+                                                .unwrap_or_else(|| "file".to_string());
+                                            att_list.borrow_mut().push((filename.clone(), path));
+
+                                            // Add row to UI
+                                            let row = gtk::Box::builder()
+                                                .orientation(gtk::Orientation::Horizontal)
+                                                .spacing(8)
+                                                .build();
+                                            let icon = gtk::Image::builder()
+                                                .icon_name("mail-attachment-symbolic")
+                                                .build();
+                                            row.append(&icon);
+                                            let label = gtk::Label::builder()
+                                                .label(&filename)
+                                                .xalign(0.0)
+                                                .hexpand(true)
+                                                .ellipsize(gtk::pango::EllipsizeMode::Middle)
+                                                .build();
+                                            row.append(&label);
+
+                                            let remove_btn = gtk::Button::builder()
+                                                .icon_name("window-close-symbolic")
+                                                .css_classes(["flat", "circular"])
+                                                .tooltip_text("Remove")
+                                                .build();
+                                            let att_box2 = att_box.clone();
+                                            let att_list2 = att_list.clone();
+                                            let fname = filename.clone();
+                                            let row_ref = row.clone();
+                                            remove_btn.connect_clicked(move |_| {
+                                                att_box2.remove(&row_ref);
+                                                att_list2.borrow_mut().retain(|(n, _)| n != &fname);
+                                                if att_list2.borrow().is_empty() {
+                                                    att_box2.set_visible(false);
+                                                }
+                                            });
+                                            row.append(&remove_btn);
+                                            att_box.append(&row);
+                                            att_box.set_visible(true);
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    );
+                });
+            }
+
+            // Set up autocomplete on address fields
+            let contacts = self.contacts.clone();
+            setup_address_autocomplete(&to_entry, contacts.clone());
+            setup_address_autocomplete(&cc_entry, contacts.clone());
+            setup_address_autocomplete(&bcc_entry, contacts);
+
             // Store references
             *self.from_dropdown.borrow_mut() = Some(from_dropdown);
             *self.to_entry.borrow_mut() = Some(to_entry);
@@ -188,6 +306,10 @@ mod imp {
             *self.send_button.borrow_mut() = Some(send_button);
             *self.cc_row.borrow_mut() = Some(cc_row);
             *self.bcc_row.borrow_mut() = Some(bcc_row);
+            *self.sending_bar.borrow_mut() = Some(sending_bar);
+            *self.form_box.borrow_mut() = Some(form);
+            *self.body_scrolled.borrow_mut() = Some(scrolled);
+            *self.attachments_box.borrow_mut() = Some(attachments_box);
         }
     }
 
@@ -215,6 +337,122 @@ mod imp {
     }
 }
 
+/// Set up autocomplete on an address Entry using a Popover + ListBox.
+///
+/// Filters contacts as the user types, matching the token after the last comma.
+/// On selection, appends the chosen address to the entry.
+fn setup_address_autocomplete(entry: &gtk::Entry, contacts: Rc<RefCell<Vec<ContactEntry>>>) {
+    let popover = gtk::Popover::builder()
+        .autohide(false)
+        .has_arrow(false)
+        .build();
+
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .max_content_height(200)
+        .propagate_natural_height(true)
+        .build();
+
+    let listbox = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::Single)
+        .build();
+    listbox.add_css_class("boxed-list");
+
+    scrolled.set_child(Some(&listbox));
+    popover.set_child(Some(&scrolled));
+    popover.set_parent(entry);
+
+    // When a row is activated, insert the contact into the entry
+    let entry_for_activate = entry.clone();
+    let popover_for_activate = popover.clone();
+    listbox.connect_row_activated(move |_, row| {
+        if let Some(email) = row.widget_name().strip_prefix("contact:") {
+            let current = entry_for_activate.text().to_string();
+            // Replace the current incomplete token with the selected address
+            let new_text = if let Some(last_comma) = current.rfind(',') {
+                format!("{}, {email}, ", &current[..=last_comma])
+            } else {
+                format!("{email}, ")
+            };
+            entry_for_activate.set_text(&new_text);
+            entry_for_activate.set_position(-1); // cursor to end
+        }
+        popover_for_activate.popdown();
+    });
+
+    // Filter and show popover on text changes
+    let popover_for_changed = popover.clone();
+    let listbox_for_changed = listbox.clone();
+    entry.connect_changed(move |entry| {
+        let text = entry.text().to_string();
+
+        // Extract the current token being typed (after last comma)
+        let current_token = if let Some(last_comma) = text.rfind(',') {
+            text[last_comma + 1..].trim()
+        } else {
+            text.trim()
+        };
+
+        if current_token.len() < 2 {
+            popover_for_changed.popdown();
+            return;
+        }
+
+        let query = current_token.to_lowercase();
+        let contacts = contacts.borrow();
+
+        // Filter matching contacts (max 8 results)
+        let matches: Vec<&ContactEntry> = contacts
+            .iter()
+            .filter(|c| {
+                c.email.to_lowercase().contains(&query)
+                    || c.display_name
+                        .as_ref()
+                        .map(|n| n.to_lowercase().contains(&query))
+                        .unwrap_or(false)
+            })
+            .take(8)
+            .collect();
+
+        if matches.is_empty() {
+            popover_for_changed.popdown();
+            return;
+        }
+
+        // Clear old rows
+        while let Some(child) = listbox_for_changed.first_child() {
+            listbox_for_changed.remove(&child);
+        }
+
+        // Add matching contacts
+        for contact in &matches {
+            let label_text = if let Some(ref name) = contact.display_name {
+                format!("{name} <{}>", contact.email)
+            } else {
+                contact.email.clone()
+            };
+
+            let label = gtk::Label::builder()
+                .label(&label_text)
+                .xalign(0.0)
+                .margin_start(8)
+                .margin_end(8)
+                .margin_top(4)
+                .margin_bottom(4)
+                .build();
+
+            let row = gtk::ListBoxRow::builder()
+                .child(&label)
+                .build();
+            // Store the email in the widget name for retrieval on activation
+            row.set_widget_name(&format!("contact:{}", contact.email));
+            listbox_for_changed.append(&row);
+        }
+
+        popover_for_changed.popup();
+    });
+}
+
 glib::wrapper! {
     pub struct MqComposeWindow(ObjectSubclass<imp::MqComposeWindow>)
         @extends adw::Window, gtk::Window, gtk::Widget,
@@ -227,6 +465,11 @@ impl MqComposeWindow {
         let win: Self = glib::Object::builder().build();
         win.set_transient_for(Some(parent));
         win
+    }
+
+    /// Set the available contacts for autocomplete in address fields.
+    pub fn set_contacts(&self, contacts: Vec<ContactEntry>) {
+        *self.imp().contacts.borrow_mut() = contacts;
     }
 
     /// Set the available accounts in the From dropdown.
@@ -299,7 +542,7 @@ impl MqComposeWindow {
         }
     }
 
-    /// Get the To addresses (comma-separated string → Vec).
+    /// Get the To addresses (comma-separated string -> Vec).
     pub fn to_addresses(&self) -> Vec<String> {
         self.imp()
             .to_entry
@@ -353,6 +596,43 @@ impl MqComposeWindow {
             .unwrap_or_default()
     }
 
+    /// Get the list of attached files: (filename, path).
+    pub fn attachments(&self) -> Vec<(String, std::path::PathBuf)> {
+        self.imp().attachments.borrow().clone()
+    }
+
+    /// Enter sending state: disable all inputs, show pulsing progress bar.
+    pub fn set_sending(&self, sending: bool) {
+        let imp = self.imp();
+        if let Some(bar) = imp.sending_bar.borrow().as_ref() {
+            bar.set_visible(sending);
+            if sending {
+                bar.set_text(Some("Sending\u{2026}"));
+                bar.set_show_text(true);
+                bar.pulse();
+                // Pulse the bar periodically while sending
+                let bar = bar.clone();
+                glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+                    if bar.is_visible() {
+                        bar.pulse();
+                        glib::ControlFlow::Continue
+                    } else {
+                        glib::ControlFlow::Break
+                    }
+                });
+            }
+        }
+        if let Some(btn) = imp.send_button.borrow().as_ref() {
+            btn.set_sensitive(!sending);
+        }
+        if let Some(form) = imp.form_box.borrow().as_ref() {
+            form.set_sensitive(!sending);
+        }
+        if let Some(scrolled) = imp.body_scrolled.borrow().as_ref() {
+            scrolled.set_sensitive(!sending);
+        }
+    }
+
     /// Connect a callback for the Send button.
     pub fn connect_send<F: Fn() + 'static>(&self, f: F) {
         if let Some(btn) = self.imp().send_button.borrow().as_ref() {
@@ -397,11 +677,19 @@ impl MqComposeWindow {
             } => {
                 self.set_title(Some("Reply All"));
                 self.set_to(from);
-                // Merge original To + Cc into Cc (excluding the sender)
+                // Get the user's own email to exclude from CC
+                let self_email = self.selected_account()
+                    .map(|(_, e)| e.to_lowercase())
+                    .unwrap_or_default();
+                // Merge original To + Cc into Cc (excluding the sender and self)
                 let mut all_cc: Vec<String> = to
                     .iter()
                     .chain(cc.iter())
                     .filter(|a| a != &from)
+                    .filter(|a| {
+                        let lower = a.to_lowercase();
+                        !lower.contains(&self_email) || self_email.is_empty()
+                    })
                     .cloned()
                     .collect();
                 all_cc.dedup();

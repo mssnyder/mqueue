@@ -51,6 +51,14 @@ mod imp {
         /// Account email shown as badge in unified view (empty if single-account).
         #[property(get, set)]
         account_email: RefCell<String>,
+
+        /// Gmail thread ID for conversation grouping.
+        #[property(get, set)]
+        gmail_thread_id: Cell<i64>,
+
+        /// Number of messages in this thread (1 = single message).
+        #[property(get, set)]
+        thread_count: Cell<i64>,
     }
 
     #[glib::object_subclass]
@@ -82,6 +90,8 @@ impl MessageObject {
         mailbox: &str,
         account_id: i64,
         account_email: &str,
+        gmail_thread_id: i64,
+        thread_count: i64,
     ) -> Self {
         glib::Object::builder()
             .property("db-id", db_id)
@@ -97,6 +107,8 @@ impl MessageObject {
             .property("mailbox", mailbox)
             .property("account-id", account_id)
             .property("account-email", account_email)
+            .property("gmail-thread-id", gmail_thread_id)
+            .property("thread-count", thread_count)
             .build()
     }
 }

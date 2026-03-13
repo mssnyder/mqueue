@@ -93,6 +93,82 @@ pub fn parse_mime(raw: &[u8]) -> ParsedBody {
     }
 }
 
+/// Resolve `cid:` image references in HTML by inlining them as `data:` URIs.
+///
+/// Parses the raw MIME to find inline parts with Content-ID headers, then
+/// replaces any `src="cid:xxx"` in the HTML with `data:mime/type;base64,...`.
+/// CID images are embedded content (not remote), so this is always safe.
+pub fn resolve_cid_images(html: &str, raw_mime: &[u8]) -> String {
+    use base64::Engine;
+    use mail_parser::MimeHeaders;
+
+    let message = match mail_parser::MessageParser::default().parse(raw_mime) {
+        Some(msg) => msg,
+        None => return html.to_string(),
+    };
+
+    // Collect all parts that have a Content-ID
+    let mut cid_parts: Vec<(String, String, Vec<u8>)> = Vec::new();
+    for part in &message.parts {
+        if let Some(cid) = part.content_id() {
+            let cid_clean = cid.trim_matches('<').trim_matches('>').to_string();
+            let mime_type = part
+                .content_type()
+                .map(|ct| {
+                    let main = ct.ctype();
+                    match ct.subtype() {
+                        Some(sub) => format!("{main}/{sub}"),
+                        None => main.to_string(),
+                    }
+                })
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let data = part.contents().to_vec();
+            if !data.is_empty() {
+                cid_parts.push((cid_clean, mime_type, data));
+            }
+        }
+    }
+
+    if cid_parts.is_empty() {
+        return html.to_string();
+    }
+
+    // Replace all cid: references in img src attributes
+    let mut result = html.to_string();
+    for (cid, mime_type, data) in &cid_parts {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+        let data_uri = format!("data:{mime_type};base64,{b64}");
+
+        // Replace src="cid:xxx" (with or without angle brackets)
+        let patterns = [
+            format!("src=\"cid:{cid}\""),
+            format!("src='cid:{cid}'"),
+            format!("src=\"cid:&lt;{cid}&gt;\""),
+        ];
+        for pat in &patterns {
+            if result.contains(pat.as_str()) {
+                result = result.replace(pat.as_str(), &format!("src=\"{data_uri}\""));
+            }
+        }
+    }
+
+    result
+}
+
+/// Extract the raw content of an attachment from a raw MIME message.
+///
+/// `section_index` is the part index stored in `Attachment::imap_section`.
+pub fn extract_attachment_content(raw: &[u8], section_index: usize) -> Option<Vec<u8>> {
+    let message = mail_parser::MessageParser::default().parse(raw)?;
+    let part = message.parts.get(section_index)?;
+    let contents = part.contents();
+    if contents.is_empty() {
+        None
+    } else {
+        Some(contents.to_vec())
+    }
+}
+
 /// Generate a short snippet from body text (first ~200 chars, single line).
 fn make_snippet(text: &str) -> String {
     let trimmed: String = text
@@ -103,9 +179,14 @@ fn make_snippet(text: &str) -> String {
     if trimmed.len() <= 200 {
         trimmed.to_string()
     } else {
-        let mut end = 200;
+        // Find a safe char boundary at or before byte 200
+        let mut safe = 200;
+        while safe > 0 && !trimmed.is_char_boundary(safe) {
+            safe -= 1;
+        }
+        let mut end = safe;
         // Try to break at a word boundary
-        if let Some(pos) = trimmed[..200].rfind(' ') {
+        if let Some(pos) = trimmed[..safe].rfind(' ') {
             end = pos;
         }
         format!("{}…", &trimmed[..end])

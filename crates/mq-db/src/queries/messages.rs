@@ -139,6 +139,30 @@ pub async fn delete_message(pool: &SqlitePool, message_id: i64) -> sqlx::Result<
     Ok(())
 }
 
+/// Delete messages by IMAP UID that no longer exist on the server (expunged).
+pub async fn delete_expunged(
+    pool: &SqlitePool,
+    account_id: i64,
+    mailbox: &str,
+    uids: &[u32],
+) -> sqlx::Result<u64> {
+    if uids.is_empty() {
+        return Ok(0);
+    }
+    // SQLite doesn't support array binds, so build the IN clause
+    let placeholders: Vec<String> = uids.iter().map(|_| "?".to_string()).collect();
+    let sql = format!(
+        "DELETE FROM messages WHERE account_id = ? AND mailbox = ? AND uid IN ({})",
+        placeholders.join(",")
+    );
+    let mut query = sqlx::query(&sql).bind(account_id).bind(mailbox);
+    for uid in uids {
+        query = query.bind(*uid as i64);
+    }
+    let result = query.execute(pool).await?;
+    Ok(result.rows_affected())
+}
+
 pub async fn get_highest_uid(
     pool: &SqlitePool,
     account_id: i64,
@@ -150,6 +174,22 @@ pub async fn get_highest_uid(
         .fetch_one(pool)
         .await?;
     Ok(row.get("max_uid"))
+}
+
+/// Get all known UIDs for a given account + mailbox (used for incremental sync).
+pub async fn get_known_uids(
+    pool: &SqlitePool,
+    account_id: i64,
+    mailbox: &str,
+) -> sqlx::Result<Vec<i64>> {
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "SELECT uid FROM messages WHERE account_id = ? AND mailbox = ?",
+    )
+    .bind(account_id)
+    .bind(mailbox)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(uid,)| uid).collect())
 }
 
 /// Get messages across ALL accounts for a given mailbox (unified inbox view).
@@ -293,6 +333,135 @@ pub async fn get_messages_by_ids(
     }
 
     query.fetch_all(pool).await
+}
+
+/// Get threaded inbox view: one row per thread (latest message), with thread count.
+///
+/// Groups messages by `gmail_thread_id`, returning the most recent message
+/// in each thread along with the number of messages in that thread.
+/// Messages without a `gmail_thread_id` are treated as their own thread.
+pub async fn get_threads_for_mailbox(
+    pool: &SqlitePool,
+    mailbox: &str,
+    limit: i64,
+    offset: i64,
+) -> sqlx::Result<Vec<(DbMessage, i64)>> {
+    // For each thread, pick the row with the latest date.
+    // Also count how many messages belong to the same thread.
+    let rows: Vec<DbMessage> = sqlx::query_as::<_, DbMessage>(
+        "SELECT m.id, m.account_id, m.uid, m.mailbox, m.gmail_msg_id, m.gmail_thread_id,
+            m.message_id, m.in_reply_to, m.references_json,
+            m.sender_name, m.sender_email, m.recipient_to, m.recipient_cc,
+            m.subject, m.snippet, m.date, m.flags, m.has_attachments, m.body_structure,
+            m.list_unsubscribe, m.list_unsubscribe_post, m.modseq, m.uid_validity, m.cached_at
+        FROM messages m
+        INNER JOIN (
+            SELECT COALESCE(gmail_thread_id, -id) AS tid, MAX(date) AS max_date
+            FROM messages
+            WHERE mailbox = ?
+            GROUP BY tid
+        ) t ON COALESCE(m.gmail_thread_id, -m.id) = t.tid AND m.date = t.max_date
+        WHERE m.mailbox = ?
+        GROUP BY COALESCE(m.gmail_thread_id, -m.id)
+        ORDER BY m.date DESC
+        LIMIT ? OFFSET ?",
+    )
+    .bind(mailbox)
+    .bind(mailbox)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+
+    // Now get thread counts for each message
+    let mut result = Vec::with_capacity(rows.len());
+    for msg in rows {
+        let count: i64 = if let Some(tid) = msg.gmail_thread_id {
+            let row: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM messages WHERE gmail_thread_id = ?",
+            )
+            .bind(tid)
+            .fetch_one(pool)
+            .await
+            .unwrap_or((1,));
+            row.0
+        } else {
+            1
+        };
+        result.push((msg, count));
+    }
+
+    Ok(result)
+}
+
+/// Get all messages in a thread, ordered oldest-first (conversation view).
+pub async fn get_thread_messages(
+    pool: &SqlitePool,
+    gmail_thread_id: i64,
+) -> sqlx::Result<Vec<DbMessage>> {
+    let mut msgs = sqlx::query_as::<_, DbMessage>(
+        "SELECT id, account_id, uid, mailbox, gmail_msg_id, gmail_thread_id,
+            message_id, in_reply_to, references_json,
+            sender_name, sender_email, recipient_to, recipient_cc,
+            subject, snippet, date, flags, has_attachments, body_structure,
+            list_unsubscribe, list_unsubscribe_post, modseq, uid_validity, cached_at
+        FROM messages
+        WHERE gmail_thread_id = ?",
+    )
+    .bind(gmail_thread_id)
+    .fetch_all(pool)
+    .await?;
+
+    // Deduplicate: same message can appear in multiple mailboxes in Gmail.
+    // Keep the first occurrence (by lowest DB id) for each gmail_msg_id.
+    {
+        let mut seen = std::collections::HashSet::new();
+        msgs.retain(|m| {
+            if let Some(gid) = m.gmail_msg_id {
+                seen.insert(gid)
+            } else {
+                true // keep messages without gmail_msg_id
+            }
+        });
+    }
+
+    // Sort by parsed date (handles both RFC 3339 and RFC 2822 stored values)
+    msgs.sort_by(|a, b| {
+        parse_date_for_sort(&a.date).cmp(&parse_date_for_sort(&b.date))
+    });
+    Ok(msgs)
+}
+
+/// Parse a date string into a sortable i64 (unix timestamp).
+/// Handles RFC 3339, RFC 2822, and common variations.
+fn parse_date_for_sort(date: &str) -> i64 {
+    use chrono::DateTime;
+    use chrono::FixedOffset;
+    let trimmed = date.trim();
+    if let Ok(dt) = DateTime::<FixedOffset>::parse_from_rfc3339(trimmed) {
+        return dt.timestamp();
+    }
+    if let Ok(dt) = DateTime::<FixedOffset>::parse_from_rfc2822(trimmed) {
+        return dt.timestamp();
+    }
+    if let Ok(dt) = DateTime::parse_from_str(trimmed, "%d %b %Y %H:%M:%S %z") {
+        return dt.timestamp();
+    }
+    0
+}
+
+/// Update the snippet column for a message (called after body is parsed).
+pub async fn update_snippet(
+    pool: &SqlitePool,
+    message_id: i64,
+    snippet: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE messages SET snippet = ? WHERE id = ?")
+        .bind(snippet)
+        .bind(message_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Update the FTS body_text for a message (called when body is fetched).

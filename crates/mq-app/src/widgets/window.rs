@@ -18,6 +18,7 @@ mod imp {
         pub message_view: RefCell<Option<MqMessageView>>,
         pub split_view: RefCell<Option<adw::NavigationSplitView>>,
         pub banner: RefCell<Option<adw::Banner>>,
+        pub progress_bar: RefCell<Option<gtk::ProgressBar>>,
     }
 
     #[glib::object_subclass]
@@ -33,7 +34,7 @@ mod imp {
 
             let window = self.obj();
             window.set_title(Some(config::APP_NAME));
-            window.set_default_size(900, 600);
+            window.set_default_size(1100, 700);
             window.set_size_request(360, 294);
 
             // Main vertical box: banner + content
@@ -46,6 +47,14 @@ mod imp {
                 .revealed(false)
                 .build();
             main_box.append(&banner);
+
+            // Sync progress bar (hidden by default)
+            let progress_bar = gtk::ProgressBar::builder()
+                .visible(false)
+                .show_text(true)
+                .build();
+            progress_bar.add_css_class("osd");
+            main_box.append(&progress_bar);
 
             // Create widgets
             let sidebar = MqSidebar::new();
@@ -66,8 +75,8 @@ mod imp {
                 .content(&message_view)
                 .collapsed(false)
                 .sidebar_position(gtk::PackType::Start)
-                .min_sidebar_width(260.0)
-                .max_sidebar_width(420.0)
+                .min_sidebar_width(320.0)
+                .max_sidebar_width(520.0)
                 .build();
 
             let content_page = adw::NavigationPage::builder()
@@ -130,6 +139,7 @@ mod imp {
             *self.message_view.borrow_mut() = Some(message_view);
             *self.split_view.borrow_mut() = Some(split_view);
             *self.banner.borrow_mut() = Some(banner);
+            *self.progress_bar.borrow_mut() = Some(progress_bar);
         }
     }
 
@@ -196,16 +206,39 @@ impl MqWindow {
         }
     }
 
+    /// Show the sync progress bar with a text label and fraction (0.0–1.0).
+    pub fn show_progress(&self, text: &str, fraction: f64) {
+        if let Some(pb) = self.imp().progress_bar.borrow().clone() {
+            pb.set_text(Some(text));
+            pb.set_fraction(fraction);
+            pb.set_visible(true);
+        }
+    }
+
+    /// Hide the sync progress bar.
+    pub fn hide_progress(&self) {
+        if let Some(pb) = self.imp().progress_bar.borrow().clone() {
+            pb.set_visible(false);
+        }
+    }
+
     /// Show the preferences window.
     pub fn show_preferences(&self) {
         use super::preferences::MqPreferences;
         use tracing::error;
 
         let prefs = MqPreferences::new(self);
-        match mq_core::config::AppConfig::load() {
-            Ok(config) => prefs.load_config(&config),
-            Err(e) => error!("Failed to load config for preferences: {e}"),
-        }
+        let old_sync_all = match mq_core::config::AppConfig::load() {
+            Ok(config) => {
+                let old = config.sync.sync_all_mailboxes;
+                prefs.load_config(&config);
+                old
+            }
+            Err(e) => {
+                error!("Failed to load config for preferences: {e}");
+                false
+            }
+        };
 
         let window_clone = self.clone();
         prefs.connect_close_request(move |prefs_win| {
@@ -231,9 +264,21 @@ impl MqWindow {
                 }
             }
 
+            let sync_changed = config.sync.sync_all_mailboxes != old_sync_all;
+
             if let Err(e) = config.save() {
-                tracing::error!("Failed to save preferences: {e}");
+                tracing::error!("Failed to save config: {e}");
             }
+
+            // If sync_all_mailboxes was toggled, trigger a re-sync
+            if sync_changed {
+                adw::prelude::ActionGroupExt::activate_action(
+                    &window_clone,
+                    "app.resync",
+                    None,
+                );
+            }
+
             glib::Propagation::Proceed
         });
 
