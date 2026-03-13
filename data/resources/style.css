@@ -1,0 +1,22 @@
+.bold-label {
+    font-weight: bold;
+}
+
+.message-list {
+    background: transparent;
+}
+
+.navigation-sidebar row {
+    min-height: 36px;
+}
+
+.caption {
+    font-size: 0.8em;
+}
+
+.heading {
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-size: 0.75em;
+}

@@ -164,6 +164,68 @@ impl MqWindow {
             banner.set_revealed(false);
         }
     }
+
+    /// Show the preferences window.
+    pub fn show_preferences(&self) {
+        use super::preferences::MqPreferences;
+        use tracing::error;
+
+        let prefs = MqPreferences::new(self);
+        match mq_core::config::AppConfig::load() {
+            Ok(config) => prefs.load_config(&config),
+            Err(e) => error!("Failed to load config for preferences: {e}"),
+        }
+
+        let window_clone = self.clone();
+        prefs.connect_close_request(move |prefs_win| {
+            let prefs_win = prefs_win
+                .downcast_ref::<MqPreferences>()
+                .expect("MqPreferences expected");
+            let config = prefs_win.collect_config();
+
+            // Apply theme immediately
+            if let Some(app) = window_clone.application() {
+                let adw_app = app.downcast_ref::<adw::Application>().unwrap();
+                let style_manager = adw_app.style_manager();
+                match config.appearance.theme {
+                    mq_core::config::Theme::System => {
+                        style_manager.set_color_scheme(adw::ColorScheme::Default);
+                    }
+                    mq_core::config::Theme::Light => {
+                        style_manager.set_color_scheme(adw::ColorScheme::ForceLight);
+                    }
+                    mq_core::config::Theme::Dark => {
+                        style_manager.set_color_scheme(adw::ColorScheme::ForceDark);
+                    }
+                }
+            }
+
+            if let Err(e) = config.save() {
+                tracing::error!("Failed to save preferences: {e}");
+            }
+            glib::Propagation::Proceed
+        });
+
+        prefs.present();
+    }
+
+    /// Activate the compose flow (triggered by Ctrl+N).
+    pub fn activate_compose(&self) {
+        let list = self.message_list();
+        let btn = list.imp().compose_button.borrow().clone();
+        if let Some(btn) = btn {
+            btn.emit_clicked();
+        }
+    }
+
+    /// Toggle the search bar (triggered by Ctrl+F).
+    pub fn activate_search(&self) {
+        let list = self.message_list();
+        let btn = list.imp().search_button.borrow().clone();
+        if let Some(btn) = btn {
+            btn.set_active(!btn.is_active());
+        }
+    }
 }
 
 /// Convert IMAP mailbox name to a user-friendly display name.

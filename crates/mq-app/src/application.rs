@@ -30,6 +30,26 @@ pub fn run() -> i32 {
     app.connect_activate(|app| {
         info!("Application activate");
         let window = MqWindow::new(app);
+
+        // Register actions and keyboard shortcuts
+        crate::actions::setup_actions(app, &window);
+
+        // Apply saved theme preference
+        if let Ok(cfg) = mq_core::config::AppConfig::load() {
+            let style_manager = app.style_manager();
+            match cfg.appearance.theme {
+                mq_core::config::Theme::System => {
+                    style_manager.set_color_scheme(adw::ColorScheme::Default);
+                }
+                mq_core::config::Theme::Light => {
+                    style_manager.set_color_scheme(adw::ColorScheme::ForceLight);
+                }
+                mq_core::config::Theme::Dark => {
+                    style_manager.set_color_scheme(adw::ColorScheme::ForceDark);
+                }
+            }
+        }
+
         window.present();
 
         setup_data(&window);

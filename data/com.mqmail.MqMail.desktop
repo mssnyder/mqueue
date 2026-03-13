@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=m'Queue
+Comment=Privacy-focused Gmail client for Linux
+Exec=mq-mail
+Icon=com.mqmail.MqMail
+Terminal=false
+Type=Application
+Categories=Network;Email;GTK;GNOME;
+Keywords=mail;email;gmail;
+StartupNotify=true
+MimeType=x-scheme-handler/mailto;

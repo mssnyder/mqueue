@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.mqmail.MqMail</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>m'Queue</name>
+  <summary>Privacy-focused Gmail client for Linux</summary>
+
+  <description>
+    <p>
+      m'Queue is a native Linux email client built for Gmail. It blocks tracking
+      pixels, strips link trackers, provides one-click unsubscribe, and keeps
+      your data local with offline-first sync.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Gmail IMAP with Google OAuth2 — no app passwords needed</li>
+      <li>Tracking pixel detection and removal</li>
+      <li>Remote image blocking with per-sender allowlist</li>
+      <li>UTM and tracking parameter stripping from links</li>
+      <li>One-click unsubscribe (RFC 8058 / RFC 2369)</li>
+      <li>Offline-first with CONDSTORE delta sync</li>
+      <li>Multi-account support with unified inbox</li>
+      <li>Threaded conversation view</li>
+      <li>Full-text search (online via Gmail, offline via SQLite FTS5)</li>
+      <li>GNOME desktop integration with libadwaita</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">com.mqmail.MqMail.desktop</launchable>
+
+  <url type="homepage">https://github.com/mqmail/mq-mail</url>
+  <url type="bugtracker">https://github.com/mqmail/mq-mail/issues</url>
+
+  <developer id="com.mqmail">
+    <name>m'Queue Contributors</name>
+  </developer>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#99c1f1</color>
+    <color type="primary" scheme_preference="dark">#1a5fb4</color>
+  </branding>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </recommends>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.1.0" date="2026-03-12">
+      <description>
+        <p>Initial release with core email reading, compose, privacy features,
+        multi-account support, offline sync, and search.</p>
+      </description>
+    </release>
+  </releases>
+</component>

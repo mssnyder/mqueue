@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3584e4"/>
+      <stop offset="100%" stop-color="#1a5fb4"/>
+    </linearGradient>
+  </defs>
+  <!-- Rounded square background -->
+  <rect x="4" y="4" width="120" height="120" rx="28" ry="28" fill="url(#bg)"/>
+  <!-- Envelope body -->
+  <rect x="24" y="40" width="80" height="52" rx="6" ry="6" fill="#ffffff" opacity="0.95"/>
+  <!-- Envelope flap (V shape) -->
+  <path d="M24 44 L64 70 L104 44" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" opacity="0.95"/>
+  <!-- Shield icon (privacy) -->
+  <path d="M64 26 L52 32 L52 42 C52 50 57 56 64 58 C71 56 76 50 76 42 L76 32 Z"
+        fill="#ffffff" opacity="0.9"/>
+  <path d="M59 42 L62 45 L70 37" fill="none" stroke="#1a5fb4" stroke-width="2.5"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

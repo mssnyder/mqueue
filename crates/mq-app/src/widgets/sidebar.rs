@@ -36,11 +36,19 @@ mod imp {
             widget.set_orientation(gtk::Orientation::Vertical);
             widget.set_spacing(0);
 
-            // Header with app name
+            // Header with app name + hamburger menu
             let header = adw::HeaderBar::builder()
                 .title_widget(&adw::WindowTitle::new("m'Queue", ""))
                 .show_end_title_buttons(false)
                 .build();
+
+            let menu_button = gtk::MenuButton::builder()
+                .icon_name("open-menu-symbolic")
+                .tooltip_text("Main Menu")
+                .menu_model(&crate::actions::build_primary_menu())
+                .build();
+            header.pack_start(&menu_button);
+
             widget.append(&header);
 
             // Scrolled area for both lists

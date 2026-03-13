@@ -47,8 +47,17 @@
           graphene
         ];
 
-        # Filter source to only include Rust-relevant files
-        src = craneLib.cleanCargoSource ./.;
+        # Filter source to include Rust files + data directory
+        src = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            (craneLib.filterCargoSources path type)
+            || (builtins.match ".*\\.desktop$" path != null)
+            || (builtins.match ".*\\.metainfo\\.xml$" path != null)
+            || (builtins.match ".*\\.svg$" path != null)
+            || (builtins.match ".*\\.css$" path != null)
+            || (builtins.match ".*/data/.*" path != null);
+        };
 
         commonArgs = {
           inherit src nativeBuildInputs buildInputs;
@@ -58,12 +67,33 @@
         # Build just the cargo dependencies for caching
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
+        appId = "com.mqmail.MqMail";
+
         # Build the full package
         mq-mail = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
 
           # Run tests as part of the build
           doCheck = true;
+
+          # Install desktop integration files after cargo build
+          postInstall = ''
+            # Desktop file
+            install -Dm644 data/${appId}.desktop \
+              $out/share/applications/${appId}.desktop
+
+            # AppStream metainfo
+            install -Dm644 data/${appId}.metainfo.xml \
+              $out/share/metainfo/${appId}.metainfo.xml
+
+            # Application icon
+            install -Dm644 data/${appId}.svg \
+              $out/share/icons/hicolor/scalable/apps/${appId}.svg
+
+            # CSS stylesheet
+            install -Dm644 data/resources/style.css \
+              $out/share/mq-mail/style.css
+          '';
 
           meta = with pkgs.lib; {
             description = "m'Queue — A privacy-focused native Linux Gmail client";

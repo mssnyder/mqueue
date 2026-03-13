@@ -1,5 +1,6 @@
 use tracing::info;
 
+mod actions;
 mod application;
 mod config;
 mod runtime;
