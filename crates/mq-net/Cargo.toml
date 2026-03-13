@@ -13,6 +13,9 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# Async streams
+futures = "0.3"
+
 # D-Bus (NetworkManager)
 zbus = "5"
 

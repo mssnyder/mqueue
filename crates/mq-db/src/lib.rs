@@ -5,7 +5,7 @@ pub mod queries;
 use std::path::Path;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
+pub use sqlx::SqlitePool;
 use tracing::info;
 
 /// The initial migration SQL.

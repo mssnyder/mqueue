@@ -11,7 +11,7 @@ use crate::oauth;
 /// The TLS stream type used for IMAP connections.
 /// tokio TcpStream is wrapped with tokio_util::compat to provide futures_io traits
 /// that async-imap and async-native-tls require.
-type ImapTlsStream = async_native_tls::TlsStream<tokio_util::compat::Compat<TcpStream>>;
+pub type ImapTlsStream = async_native_tls::TlsStream<tokio_util::compat::Compat<TcpStream>>;
 
 /// An authenticated IMAP session connected to Gmail.
 pub struct ImapSession {
@@ -153,6 +153,20 @@ impl ImapSession {
     /// Get a mutable reference to the underlying session (for sync/idle extensions).
     pub fn inner_mut(&mut self) -> &mut async_imap::Session<ImapTlsStream> {
         &mut self.session
+    }
+
+    /// Consume this wrapper and return the underlying async-imap session.
+    ///
+    /// Used by the IDLE handler which needs ownership of the session.
+    pub fn into_inner(self) -> async_imap::Session<ImapTlsStream> {
+        self.session
+    }
+
+    /// Reconstruct from an underlying async-imap session.
+    ///
+    /// Used after IDLE returns the session via `handle.done()`.
+    pub fn from_inner(session: async_imap::Session<ImapTlsStream>) -> Self {
+        Self { session }
     }
 }
 

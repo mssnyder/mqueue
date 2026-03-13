@@ -69,3 +69,12 @@ pub async fn pending_op_count(pool: &SqlitePool, account_id: i64) -> sqlx::Resul
     .await?;
     Ok(row.get("cnt"))
 }
+
+pub async fn total_pending_count(pool: &SqlitePool) -> sqlx::Result<i64> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) as cnt FROM offline_queue WHERE status = 'pending'",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("cnt"))
+}

@@ -295,6 +295,9 @@ fn setup_ui(window: MqWindow, data: AppData) {
             show_account_setup(&w, &p);
         });
     }
+
+    // Wire network awareness (offline banner + reconnect)
+    wire_network_awareness(&window, &pool, &account_emails, is_multi_account, &shared_messages);
 }
 
 // ---------------------------------------------------------------------------
@@ -975,6 +978,139 @@ fn wire_privacy_buttons(
             }
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Network awareness & notifications
+// ---------------------------------------------------------------------------
+
+fn wire_network_awareness(
+    window: &MqWindow,
+    pool: &Arc<SqlitePool>,
+    account_emails: &Arc<HashMap<i64, String>>,
+    is_multi_account: bool,
+    shared_messages: &Rc<RefCell<Vec<MessageData>>>,
+) {
+    let w = window.clone();
+    let pool = pool.clone();
+    let emails = account_emails.clone();
+    let msgs = shared_messages.clone();
+
+    // Start network monitor on tokio runtime
+    runtime::spawn_async(
+        async move {
+            let monitor = mq_net::monitor::NetworkMonitor::new().await;
+            let connectivity = monitor.connectivity();
+            let rx = monitor.subscribe();
+            (monitor, connectivity, rx)
+        },
+        move |(monitor, initial_connectivity, mut rx): (
+            mq_net::monitor::NetworkMonitor,
+            mq_net::monitor::Connectivity,
+            tokio::sync::broadcast::Receiver<mq_net::monitor::Connectivity>,
+        )| {
+            // Show initial offline banner if needed
+            if initial_connectivity != mq_net::monitor::Connectivity::Online {
+                w.show_banner(&format!("{initial_connectivity} — some features may be unavailable"));
+            }
+
+            // Store monitor in a static for the app lifetime
+            let monitor = Arc::new(monitor);
+
+            // Watch for connectivity changes
+            let w2 = w.clone();
+            let pool2 = pool.clone();
+            let emails2 = emails.clone();
+            let msgs2 = msgs.clone();
+            glib::spawn_future_local(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(mq_net::monitor::Connectivity::Online) => {
+                            info!("Network restored — hiding offline banner");
+                            w2.hide_banner();
+
+                            // Replay offline queue for all accounts
+                            let pool3 = pool2.clone();
+                            let pool4 = pool2.clone();
+                            let w3 = w2.clone();
+                            let emails3 = emails2.clone();
+                            let msgs3 = msgs2.clone();
+                            runtime::spawn_async(
+                                async move {
+                                    let queue = mq_net::queue::OfflineQueue::new(pool3);
+                                    let total = queue.total_pending_count().await.unwrap_or(0);
+                                    if total > 0 {
+                                        info!(total, "Replaying offline queue");
+                                    }
+                                    total
+                                },
+                                move |total: i64| {
+                                    if total > 0 {
+                                        // Reload messages to reflect any changes
+                                        let mailbox = w3.sidebar().selected_mailbox();
+                                        let account_id = w3.sidebar().selected_account_id();
+                                        reload_messages(
+                                            &w3,
+                                            &pool4,
+                                            account_id,
+                                            &mailbox,
+                                            &emails3,
+                                            is_multi_account,
+                                            &msgs3,
+                                        );
+                                    }
+                                },
+                            );
+                        }
+                        Ok(connectivity) => {
+                            info!(?connectivity, "Network state changed");
+                            // Show offline/limited banner with pending op count
+                            let pool3 = pool2.clone();
+                            let w3 = w2.clone();
+                            let conn = connectivity;
+                            runtime::spawn_async(
+                                async move {
+                                    let queue = mq_net::queue::OfflineQueue::new(pool3);
+                                    let count = queue.total_pending_count().await.unwrap_or(0);
+                                    (conn, count)
+                                },
+                                move |(conn, pending): (mq_net::monitor::Connectivity, i64)| {
+                                    let msg = if pending > 0 {
+                                        format!("{conn} — {pending} pending operation{}", if pending == 1 { "" } else { "s" })
+                                    } else {
+                                        format!("{conn} — some features may be unavailable")
+                                    };
+                                    w3.show_banner(&msg);
+                                },
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            debug!(skipped = n, "Connectivity receiver lagged");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            debug!("Connectivity receiver closed");
+                            break;
+                        }
+                    }
+                }
+            });
+
+            // Keep monitor alive for the application lifetime
+            std::mem::forget(monitor);
+        },
+    );
+}
+
+/// Send a desktop notification for new mail.
+///
+/// Called when IDLE detects new messages after a sync. Will be wired
+/// into the full IDLE → sync → notify pipeline once token storage is complete.
+#[allow(dead_code)]
+fn send_new_mail_notification(app: &adw::Application, sender: &str, subject: &str) {
+    let notification = gio::Notification::new("New mail");
+    let body = format!("{sender}: {subject}");
+    notification.set_body(Some(&body));
+    app.send_notification(Some("new-mail"), &notification);
 }
 
 fn format_sender(msg: &MessageObject) -> String {
