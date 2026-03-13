@@ -1,7 +1,7 @@
 //! Message view widget for displaying email content.
 //!
 //! Phase 2: text-based display with action buttons.
-//! Phase 5: WebKitGTK sandboxed HTML rendering.
+//! Phase 5: privacy banners (images blocked, tracking pixels, unsubscribe).
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -29,6 +29,12 @@ mod imp {
         pub reply_all_button: RefCell<Option<gtk::Button>>,
         pub forward_button: RefCell<Option<gtk::Button>>,
         pub loading_spinner: RefCell<Option<gtk::Spinner>>,
+        // Privacy UI elements
+        pub images_banner: RefCell<Option<gtk::Box>>,
+        pub images_blocked_label: RefCell<Option<gtk::Label>>,
+        pub load_images_button: RefCell<Option<gtk::Button>>,
+        pub always_load_button: RefCell<Option<gtk::Button>>,
+        pub tracking_label: RefCell<Option<gtk::Label>>,
     }
 
     #[glib::object_subclass]
@@ -124,7 +130,7 @@ mod imp {
                 .height_request(32)
                 .build();
             loading_box.append(&spinner);
-            loading_box.append(&gtk::Label::new(Some("Loading message…")));
+            loading_box.append(&gtk::Label::new(Some("Loading message\u{2026}")));
             stack.add_named(&loading_box, Some("loading"));
 
             // Content area
@@ -242,6 +248,61 @@ mod imp {
 
             content.append(&header_box);
 
+            // Privacy: Images blocked banner (hidden by default)
+            let images_banner = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(8)
+                .css_classes(["card"])
+                .margin_bottom(8)
+                .visible(false)
+                .build();
+
+            let banner_inner = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(8)
+                .margin_top(8)
+                .margin_bottom(8)
+                .margin_start(12)
+                .margin_end(12)
+                .hexpand(true)
+                .build();
+
+            let shield_icon = gtk::Image::builder()
+                .icon_name("security-high-symbolic")
+                .build();
+            banner_inner.append(&shield_icon);
+
+            let images_blocked_label = gtk::Label::builder()
+                .label("Remote images blocked")
+                .xalign(0.0)
+                .hexpand(true)
+                .build();
+            banner_inner.append(&images_blocked_label);
+
+            let load_images_button = gtk::Button::builder()
+                .label("Load images")
+                .css_classes(["flat"])
+                .build();
+            banner_inner.append(&load_images_button);
+
+            let always_load_button = gtk::Button::builder()
+                .label("Always from this sender")
+                .css_classes(["flat"])
+                .build();
+            banner_inner.append(&always_load_button);
+
+            images_banner.append(&banner_inner);
+            content.append(&images_banner);
+
+            // Privacy: Tracking pixel count (hidden by default)
+            let tracking_label = gtk::Label::builder()
+                .xalign(0.0)
+                .css_classes(["dim-label", "caption"])
+                .visible(false)
+                .margin_bottom(4)
+                .build();
+            content.append(&tracking_label);
+
             // Body text view
             let body_view = gtk::TextView::builder()
                 .editable(false)
@@ -281,6 +342,11 @@ mod imp {
             *self.reply_all_button.borrow_mut() = Some(reply_all_button);
             *self.forward_button.borrow_mut() = Some(forward_button);
             *self.loading_spinner.borrow_mut() = Some(spinner);
+            *self.images_banner.borrow_mut() = Some(images_banner);
+            *self.images_blocked_label.borrow_mut() = Some(images_blocked_label);
+            *self.load_images_button.borrow_mut() = Some(load_images_button);
+            *self.always_load_button.borrow_mut() = Some(always_load_button);
+            *self.tracking_label.borrow_mut() = Some(tracking_label);
         }
     }
 
@@ -340,6 +406,10 @@ impl MqMessageView {
             btn.set_active(is_read);
         }
 
+        // Reset privacy banners (will be updated after body load)
+        self.hide_images_banner();
+        self.hide_tracking_info();
+
         self.show_content();
     }
 
@@ -369,6 +439,50 @@ impl MqMessageView {
         let imp = self.imp();
         if let Some(tv) = imp.body_view.borrow().as_ref() {
             tv.buffer().set_text(text);
+        }
+    }
+
+    /// Show the "images blocked" banner with count.
+    pub fn show_images_banner(&self, blocked_count: usize) {
+        let imp = self.imp();
+        if let Some(banner) = imp.images_banner.borrow().as_ref() {
+            banner.set_visible(true);
+        }
+        if let Some(label) = imp.images_blocked_label.borrow().as_ref() {
+            if blocked_count == 1 {
+                label.set_label("1 remote image blocked");
+            } else {
+                label.set_label(&format!("{blocked_count} remote images blocked"));
+            }
+        }
+    }
+
+    /// Hide the images blocked banner.
+    pub fn hide_images_banner(&self) {
+        if let Some(banner) = self.imp().images_banner.borrow().as_ref() {
+            banner.set_visible(false);
+        }
+    }
+
+    /// Show tracking pixel info.
+    pub fn show_tracking_info(&self, count: usize) {
+        let imp = self.imp();
+        if count > 0 {
+            if let Some(label) = imp.tracking_label.borrow().as_ref() {
+                if count == 1 {
+                    label.set_label("1 tracking pixel blocked");
+                } else {
+                    label.set_label(&format!("{count} tracking pixels blocked"));
+                }
+                label.set_visible(true);
+            }
+        }
+    }
+
+    /// Hide the tracking info label.
+    pub fn hide_tracking_info(&self) {
+        if let Some(label) = self.imp().tracking_label.borrow().as_ref() {
+            label.set_visible(false);
         }
     }
 
@@ -421,6 +535,27 @@ impl MqMessageView {
     /// Connect a callback for the forward button.
     pub fn connect_forward_clicked<F: Fn() + 'static>(&self, f: F) {
         if let Some(btn) = self.imp().forward_button.borrow().as_ref() {
+            btn.connect_clicked(move |_| f());
+        }
+    }
+
+    /// Connect a callback for the unsubscribe button.
+    pub fn connect_unsubscribe_clicked<F: Fn() + 'static>(&self, f: F) {
+        if let Some(btn) = self.imp().unsub_button.borrow().as_ref() {
+            btn.connect_clicked(move |_| f());
+        }
+    }
+
+    /// Connect a callback for "Load images" button.
+    pub fn connect_load_images<F: Fn() + 'static>(&self, f: F) {
+        if let Some(btn) = self.imp().load_images_button.borrow().as_ref() {
+            btn.connect_clicked(move |_| f());
+        }
+    }
+
+    /// Connect a callback for "Always load from this sender" button.
+    pub fn connect_always_load_images<F: Fn() + 'static>(&self, f: F) {
+        if let Some(btn) = self.imp().always_load_button.borrow().as_ref() {
             btn.connect_clicked(move |_| f());
         }
     }

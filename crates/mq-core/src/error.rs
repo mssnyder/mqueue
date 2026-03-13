@@ -15,6 +15,9 @@ pub enum MqError {
     #[error("Email parse error: {0}")]
     Parse(String),
 
+    #[error("Network error: {0}")]
+    Network(String),
+
     #[error("Network unavailable")]
     Offline,
 
@@ -33,7 +36,7 @@ impl MqError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            MqError::Imap(_) | MqError::Smtp(_) | MqError::Offline
+            MqError::Imap(_) | MqError::Smtp(_) | MqError::Network(_) | MqError::Offline
         )
     }
 
@@ -50,6 +53,7 @@ impl MqError {
             MqError::OAuth(msg) => format!("Authentication error: {msg}"),
             MqError::Db(msg) => format!("Database error: {msg}"),
             MqError::Parse(_) => "Failed to parse the email.".into(),
+            MqError::Network(msg) => format!("Network error: {msg}"),
             MqError::Offline => "No internet connection.".into(),
             MqError::TokenExpired => "Your session has expired. Please re-authenticate.".into(),
             MqError::Config(msg) => format!("Configuration error: {msg}"),

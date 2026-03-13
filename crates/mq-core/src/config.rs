@@ -38,6 +38,8 @@ pub struct OAuthConfig {
 #[serde(default)]
 pub struct PrivacyConfig {
     pub block_remote_images: bool,
+    /// Tracking pixels are always removed unconditionally.
+    /// This field is kept for config file compatibility but has no effect.
     pub detect_tracking_pixels: bool,
     pub strip_tracking_params: bool,
 }

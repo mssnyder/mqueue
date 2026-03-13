@@ -72,6 +72,7 @@ struct MessageData {
     account_id: i64,
     recipient_to: String,
     list_unsubscribe: Option<String>,
+    list_unsubscribe_post: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -215,11 +216,36 @@ fn setup_ui(window: MqWindow, data: AppData) {
 
                 let pool = pool_sel.clone();
                 let v = view.clone();
+                let sender = msg.sender_email();
+                let account = msg.account_id();
                 runtime::spawn_async(
-                    async move { load_message_body(&pool, db_id).await },
-                    move |body: Option<String>| {
-                        if let Some(text) = body {
-                            v.set_body_text(&text);
+                    async move {
+                        let body = load_message_body(&pool, db_id).await;
+                        let allowed =
+                            mq_db::queries::sender_allowlist::is_allowed(&pool, account, &sender)
+                                .await
+                                .unwrap_or(false);
+                        (body, allowed)
+                    },
+                    move |(body, sender_allowed): (Option<BodyResult>, bool)| {
+                        if let Some(body) = body {
+                            v.set_body_text(&body.text);
+                            // Show privacy banners
+                            let config =
+                                mq_core::config::AppConfig::load().unwrap_or_default();
+                            let show_images_banner = config.privacy.block_remote_images
+                                && !sender_allowed
+                                && body.blocked_images > 0;
+                            if show_images_banner {
+                                v.show_images_banner(body.blocked_images);
+                            } else {
+                                v.hide_images_banner();
+                            }
+                            if body.tracking_pixels > 0 {
+                                v.show_tracking_info(body.tracking_pixels);
+                            } else {
+                                v.hide_tracking_info();
+                            }
                         }
                     },
                 );
@@ -231,6 +257,9 @@ fn setup_ui(window: MqWindow, data: AppData) {
 
     // Wire compose & reply buttons
     wire_compose_buttons(&window, &pool, &data.accounts, &shared_messages);
+
+    // Wire privacy / unsubscribe buttons
+    wire_privacy_buttons(&window, &pool, &shared_messages);
 
     // Wire sidebar: account selection → reload messages
     {
@@ -453,6 +482,7 @@ fn db_to_message_data(messages: Vec<mq_db::models::DbMessage>) -> Vec<MessageDat
             account_id: m.account_id,
             recipient_to: m.recipient_to,
             list_unsubscribe: m.list_unsubscribe,
+            list_unsubscribe_post: m.list_unsubscribe_post,
         })
         .collect()
 }
@@ -604,7 +634,7 @@ fn wire_compose_buttons(
                 let w = w.clone();
                 let pool = pool.clone();
                 runtime::spawn_async(
-                    async move { load_message_body(&pool, db_id).await },
+                    async move { load_message_body_text(&pool, db_id).await },
                     move |body: Option<String>| {
                         let body_text = body.unwrap_or_default();
                         let mode = ComposeMode::Reply {
@@ -648,7 +678,7 @@ fn wire_compose_buttons(
                 let w = w.clone();
                 let pool = pool.clone();
                 runtime::spawn_async(
-                    async move { load_message_body(&pool, db_id).await },
+                    async move { load_message_body_text(&pool, db_id).await },
                     move |body: Option<String>| {
                         let body_text = body.unwrap_or_default();
                         let mode = ComposeMode::ReplyAll {
@@ -689,7 +719,7 @@ fn wire_compose_buttons(
                 let w = w.clone();
                 let pool = pool.clone();
                 runtime::spawn_async(
-                    async move { load_message_body(&pool, db_id).await },
+                    async move { load_message_body_text(&pool, db_id).await },
                     move |body: Option<String>| {
                         let body_text = body.unwrap_or_default();
                         let mode = ComposeMode::Forward {
@@ -783,6 +813,170 @@ fn open_compose(
     compose.present();
 }
 
+// ---------------------------------------------------------------------------
+// Privacy / Unsubscribe
+// ---------------------------------------------------------------------------
+
+fn wire_privacy_buttons(
+    window: &MqWindow,
+    pool: &Arc<SqlitePool>,
+    shared_messages: &Rc<RefCell<Vec<MessageData>>>,
+) {
+    let view = window.message_view();
+
+    // Unsubscribe button
+    {
+        let ml = window.message_list();
+        let msgs = shared_messages.clone();
+        let pool = pool.clone();
+        let w = window.clone();
+        view.connect_unsubscribe_clicked(move || {
+            if let Some(msg) = selected_message(&ml) {
+                let db_id = msg.db_id();
+                let msgs = msgs.borrow();
+                let msg_data = msgs.iter().find(|m| m.db_id == db_id);
+
+                if let Some(data) = msg_data {
+                    if let Some(ref header) = data.list_unsubscribe {
+                        let info = mq_core::privacy::unsubscribe::UnsubscribeInfo::parse(
+                            header,
+                            data.list_unsubscribe_post.as_deref(),
+                        );
+
+                        match info.recommended_action() {
+                            Some(mq_core::privacy::unsubscribe::UnsubscribeAction::OneClickPost {
+                                url,
+                            }) => {
+                                info!(%url, "One-click unsubscribe (RFC 8058)");
+                                let pool = pool.clone();
+                                let ml = ml.clone();
+                                let w = w.clone();
+                                runtime::spawn_async(
+                                    async move {
+                                        mq_core::privacy::unsubscribe::one_click_unsubscribe(&url)
+                                            .await
+                                    },
+                                    move |result| match result {
+                                        Ok(()) => {
+                                            info!("Unsubscribe successful");
+                                            // Delete the message
+                                            let db_id_del = db_id;
+                                            remove_selected(&ml);
+                                            w.message_view().show_placeholder();
+                                            runtime::spawn_async(
+                                                async move {
+                                                    let _ = mq_db::queries::messages::delete_message(
+                                                        &pool, db_id_del,
+                                                    )
+                                                    .await;
+                                                },
+                                                |_| {},
+                                            );
+                                        }
+                                        Err(e) => {
+                                            error!("Unsubscribe failed: {e}");
+                                            w.show_banner(&format!(
+                                                "Unsubscribe failed: {}",
+                                                e.user_message()
+                                            ));
+                                        }
+                                    },
+                                );
+                            }
+                            Some(
+                                mq_core::privacy::unsubscribe::UnsubscribeAction::OpenInBrowser {
+                                    url,
+                                },
+                            ) => {
+                                info!(%url, "Opening unsubscribe URL in browser");
+                                let cleaned =
+                                    mq_core::privacy::links::strip_tracking_params(&url);
+                                let _ = gio::AppInfo::launch_default_for_uri(
+                                    &cleaned,
+                                    None::<&gio::AppLaunchContext>,
+                                );
+                            }
+                            Some(mq_core::privacy::unsubscribe::UnsubscribeAction::Mailto {
+                                address,
+                            }) => {
+                                info!(%address, "Opening mailto unsubscribe");
+                                let _ = gio::AppInfo::launch_default_for_uri(
+                                    &address,
+                                    None::<&gio::AppLaunchContext>,
+                                );
+                            }
+                            None => {
+                                warn!("No unsubscribe action available");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // "Load images" button — reload body without blocking
+    {
+        let ml = window.message_list();
+        let pool = pool.clone();
+        let v = view.clone();
+        view.connect_load_images(move || {
+            if let Some(msg) = selected_message(&ml) {
+                let db_id = msg.db_id();
+                let pool = pool.clone();
+                let v = v.clone();
+                runtime::spawn_async(
+                    async move { load_message_body_unblocked(&pool, db_id).await },
+                    move |body: Option<BodyResult>| {
+                        if let Some(body) = body {
+                            v.set_body_text(&body.text);
+                            v.hide_images_banner();
+                        }
+                    },
+                );
+            }
+        });
+    }
+
+    // "Always load from this sender" button — add to allowlist + reload
+    {
+        let ml = window.message_list();
+        let pool = pool.clone();
+        let v = view.clone();
+        view.connect_always_load_images(move || {
+            if let Some(msg) = selected_message(&ml) {
+                let db_id = msg.db_id();
+                let sender_email = msg.sender_email();
+                let account_id = msg.account_id();
+                let pool = pool.clone();
+                let v = v.clone();
+                runtime::spawn_async(
+                    async move {
+                        // Add to allowlist
+                        if let Err(e) = mq_db::queries::sender_allowlist::add_sender(
+                            &pool,
+                            account_id,
+                            &sender_email,
+                        )
+                        .await
+                        {
+                            warn!("Failed to add sender to allowlist: {e}");
+                        }
+                        // Reload body unblocked
+                        load_message_body_unblocked(&pool, db_id).await
+                    },
+                    move |body: Option<BodyResult>| {
+                        if let Some(body) = body {
+                            v.set_body_text(&body.text);
+                            v.hide_images_banner();
+                        }
+                    },
+                );
+            }
+        });
+    }
+}
+
 fn format_sender(msg: &MessageObject) -> String {
     if msg.sender_name().is_empty() {
         msg.sender_email()
@@ -795,13 +989,92 @@ fn format_sender(msg: &MessageObject) -> String {
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn load_message_body(pool: &SqlitePool, message_id: i64) -> Option<String> {
+struct BodyResult {
+    text: String,
+    blocked_images: usize,
+    tracking_pixels: usize,
+}
+
+async fn load_message_body(pool: &SqlitePool, message_id: i64) -> Option<BodyResult> {
+    let config = mq_core::config::AppConfig::load().unwrap_or_default();
+    match mq_db::queries::message_bodies::get_body(pool, message_id).await {
+        Ok(Some(body)) => {
+            if let Some(text) = body.text_body {
+                Some(BodyResult {
+                    text,
+                    blocked_images: 0,
+                    tracking_pixels: 0,
+                })
+            } else if let Some(html) = body.html_body {
+                // Apply privacy sanitization to HTML
+                let sanitized = mq_core::privacy::images::sanitize_html(
+                    &html,
+                    config.privacy.block_remote_images,
+                    config.privacy.detect_tracking_pixels,
+                );
+                // Convert to plain text for display (no WebKitGTK yet)
+                let text = mq_core::privacy::images::html_to_plain_text(&sanitized.html);
+                Some(BodyResult {
+                    text,
+                    blocked_images: sanitized.blocked_image_count,
+                    tracking_pixels: sanitized.tracking_pixel_count,
+                })
+            } else {
+                None
+            }
+        }
+        Ok(None) => None,
+        Err(e) => {
+            warn!("Failed to load message body: {e}");
+            None
+        }
+    }
+}
+
+/// Load message body without image blocking (user clicked "Load images").
+async fn load_message_body_unblocked(pool: &SqlitePool, message_id: i64) -> Option<BodyResult> {
+    let config = mq_core::config::AppConfig::load().unwrap_or_default();
+    match mq_db::queries::message_bodies::get_body(pool, message_id).await {
+        Ok(Some(body)) => {
+            if let Some(text) = body.text_body {
+                Some(BodyResult {
+                    text,
+                    blocked_images: 0,
+                    tracking_pixels: 0,
+                })
+            } else if let Some(html) = body.html_body {
+                // Don't block images, but still detect tracking pixels
+                let sanitized = mq_core::privacy::images::sanitize_html(
+                    &html,
+                    false, // don't block
+                    config.privacy.detect_tracking_pixels,
+                );
+                let text = mq_core::privacy::images::html_to_plain_text(&sanitized.html);
+                Some(BodyResult {
+                    text,
+                    blocked_images: 0,
+                    tracking_pixels: sanitized.tracking_pixel_count,
+                })
+            } else {
+                None
+            }
+        }
+        Ok(None) => None,
+        Err(e) => {
+            warn!("Failed to load message body: {e}");
+            None
+        }
+    }
+}
+
+/// Load message body as plain text (for compose reply/forward — no privacy counters needed).
+async fn load_message_body_text(pool: &SqlitePool, message_id: i64) -> Option<String> {
     match mq_db::queries::message_bodies::get_body(pool, message_id).await {
         Ok(Some(body)) => {
             if let Some(text) = body.text_body {
                 Some(text)
             } else if let Some(html) = body.html_body {
-                Some(strip_html_tags(&html))
+                Some(mq_core::privacy::images::html_to_plain_text(&html))
             } else {
                 None
             }
@@ -864,23 +1137,6 @@ fn remove_selected(list: &crate::widgets::message_list::MqMessageList) {
     if pos < model.n_items() {
         model.remove(pos);
     }
-}
-
-fn strip_html_tags(html: &str) -> String {
-    let mut result = String::with_capacity(html.len());
-    let mut in_tag = false;
-    for ch in html.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => result.push(ch),
-            _ => {}
-        }
-    }
-    result
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn load_css() {
