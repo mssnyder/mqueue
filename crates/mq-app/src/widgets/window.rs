@@ -33,7 +33,8 @@ mod imp {
 
             let window = self.obj();
             window.set_title(Some(config::APP_NAME));
-            window.set_default_size(1200, 800);
+            window.set_default_size(900, 600);
+            window.set_size_request(360, 294);
 
             // Main vertical box: banner + content
             let main_box = gtk::Box::builder()
@@ -58,13 +59,15 @@ mod imp {
                 .build();
 
             // Content: overlay split view (message list + message view)
+            // When collapsed (narrow window), the message list becomes a
+            // slide-over overlay so the message view gets full width.
             let content_split = adw::OverlaySplitView::builder()
                 .sidebar(&message_list)
                 .content(&message_view)
                 .collapsed(false)
                 .sidebar_position(gtk::PackType::Start)
-                .min_sidebar_width(350.0)
-                .max_sidebar_width(500.0)
+                .min_sidebar_width(260.0)
+                .max_sidebar_width(420.0)
                 .build();
 
             let content_page = adw::NavigationPage::builder()
@@ -77,12 +80,40 @@ mod imp {
                 .sidebar(&sidebar_page)
                 .content(&content_page)
                 .min_sidebar_width(200.0)
-                .max_sidebar_width(300.0)
+                .max_sidebar_width(280.0)
+                .vexpand(true)
                 .build();
 
             main_box.append(&split_view);
 
             window.set_content(Some(&main_box));
+
+            // --- Adaptive breakpoints ---
+            // Collapse the inner OverlaySplitView when the window is narrow
+            // (e.g. half-tiled on a 1920px display → ~960px, or third-tiled → ~640px).
+            let bp_inner = adw::Breakpoint::new(
+                adw::BreakpointCondition::parse("max-width: 720sp")
+                    .expect("valid breakpoint condition"),
+            );
+            bp_inner.add_setter(&content_split, "collapsed", Some(&true.to_value()));
+            window.add_breakpoint(bp_inner);
+
+            // --- Wire the message-view sidebar button to the overlay split ---
+            // The button is only visible when the OverlaySplitView is collapsed.
+            if let Some(sidebar_btn) = message_view.sidebar_button() {
+                // Show the button only when collapsed
+                content_split
+                    .bind_property("collapsed", &sidebar_btn, "visible")
+                    .sync_create()
+                    .build();
+
+                // Bind the button's active state ↔ show-sidebar
+                content_split
+                    .bind_property("show-sidebar", &sidebar_btn, "active")
+                    .bidirectional()
+                    .sync_create()
+                    .build();
+            }
 
             // Wire sidebar selection to update message list title
             let content_page_clone = content_page.clone();

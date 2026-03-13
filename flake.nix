@@ -93,6 +93,10 @@
             # CSS stylesheet
             install -Dm644 data/resources/style.css \
               $out/share/mq-mail/style.css
+
+            # Bundled fallback icons (used when the user's icon theme
+            # doesn't include symbolic variants)
+            cp -r data/icons $out/share/mq-mail/icons
           '';
 
           meta = with pkgs.lib; {

@@ -1,4 +1,7 @@
 //! Account setup dialog for adding Gmail accounts via OAuth2.
+//!
+//! Uses `adw::Dialog` so the sheet is rendered *inside* the parent window —
+//! guaranteed to be centered regardless of compositor / tiling WM behaviour.
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -10,7 +13,6 @@ mod imp {
 
     #[derive(Debug, Default)]
     pub struct MqAccountSetup {
-        pub status_page: RefCell<Option<adw::StatusPage>>,
         pub sign_in_button: RefCell<Option<gtk::Button>>,
         pub spinner: RefCell<Option<gtk::Spinner>>,
         pub stack: RefCell<Option<gtk::Stack>>,
@@ -20,22 +22,17 @@ mod imp {
     impl ObjectSubclass for MqAccountSetup {
         const NAME: &'static str = "MqAccountSetup";
         type Type = super::MqAccountSetup;
-        type ParentType = adw::Window;
+        type ParentType = adw::Dialog;
     }
 
     impl ObjectImpl for MqAccountSetup {
         fn constructed(&self) {
             self.parent_constructed();
 
-            let window = self.obj();
-            window.set_title(Some("Add Gmail Account"));
-            window.set_default_size(450, 400);
-            window.set_modal(true);
-            window.set_resizable(false);
-
-            let toolbar_view = adw::ToolbarView::new();
-            let header = adw::HeaderBar::new();
-            toolbar_view.add_top_bar(&header);
+            let dialog = self.obj();
+            dialog.set_title("Add Gmail Account");
+            dialog.set_content_width(400);
+            dialog.set_content_height(460);
 
             let stack = gtk::Stack::builder()
                 .transition_type(gtk::StackTransitionType::Crossfade)
@@ -69,7 +66,7 @@ mod imp {
 
             // --- Loading page ---
             let loading_page = adw::StatusPage::builder()
-                .title("Waiting for sign-in…")
+                .title("Waiting for sign-in\u{2026}")
                 .description("Complete the sign-in in your browser, then return here.")
                 .build();
 
@@ -113,10 +110,9 @@ mod imp {
 
             stack.set_visible_child_name("welcome");
 
-            toolbar_view.set_content(Some(&stack));
-            window.set_content(Some(&toolbar_view));
+            // adw::Dialog provides its own header bar; just set the child content.
+            dialog.set_child(Some(&stack));
 
-            *self.status_page.borrow_mut() = Some(welcome_page);
             *self.sign_in_button.borrow_mut() = Some(sign_in_button);
             *self.spinner.borrow_mut() = Some(spinner);
             *self.stack.borrow_mut() = Some(stack);
@@ -124,22 +120,18 @@ mod imp {
     }
 
     impl WidgetImpl for MqAccountSetup {}
-    impl WindowImpl for MqAccountSetup {}
-    impl AdwWindowImpl for MqAccountSetup {}
+    impl AdwDialogImpl for MqAccountSetup {}
 }
 
 glib::wrapper! {
     pub struct MqAccountSetup(ObjectSubclass<imp::MqAccountSetup>)
-        @extends adw::Window, gtk::Window, gtk::Widget,
-        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget,
-            gtk::Native, gtk::Root, gtk::ShortcutManager;
+        @extends adw::Dialog, gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
 impl MqAccountSetup {
-    pub fn new(parent: &impl IsA<gtk::Window>) -> Self {
-        let obj: Self = glib::Object::builder().build();
-        obj.set_transient_for(Some(parent));
-        obj
+    pub fn new() -> Self {
+        glib::Object::builder().build()
     }
 
     /// Connect the sign-in button click. The callback receives no arguments;
@@ -170,9 +162,9 @@ impl MqAccountSetup {
             stack.set_visible_child_name("success");
         }
 
-        let window = self.clone();
+        let dialog = self.clone();
         glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
-            window.close();
+            dialog.close();
         });
     }
 

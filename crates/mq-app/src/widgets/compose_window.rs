@@ -69,7 +69,8 @@ mod imp {
 
             let window = self.obj();
             window.set_title(Some("New Message"));
-            window.set_default_size(700, 550);
+            window.set_default_size(640, 500);
+            window.set_size_request(360, 350);
 
             let main_box = gtk::Box::builder()
                 .orientation(gtk::Orientation::Vertical)

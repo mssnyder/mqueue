@@ -1,0 +1,17 @@
+[Icon Theme]
+Name=Hicolor
+Comment=Fallback Icon Theme
+Inherits=hicolor
+Directories=scalable/actions,scalable/emblems
+
+[scalable/actions]
+Size=16
+MinSize=16
+MaxSize=512
+Type=Scalable
+
+[scalable/emblems]
+Size=16
+MinSize=16
+MaxSize=512
+Type=Scalable

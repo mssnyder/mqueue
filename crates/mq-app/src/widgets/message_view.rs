@@ -35,6 +35,9 @@ mod imp {
         pub load_images_button: RefCell<Option<gtk::Button>>,
         pub always_load_button: RefCell<Option<gtk::Button>>,
         pub tracking_label: RefCell<Option<gtk::Label>>,
+        /// Button to show/hide the sidebar (message list) when the split view
+        /// is collapsed. Only visible in narrow layouts.
+        pub sidebar_button: RefCell<Option<gtk::ToggleButton>>,
     }
 
     #[glib::object_subclass]
@@ -56,6 +59,14 @@ mod imp {
                 .show_start_title_buttons(false)
                 .build();
             header.set_title_widget(Some(&adw::WindowTitle::new("Message", "")));
+
+            // Sidebar toggle — only visible when the overlay split collapses
+            let sidebar_button = gtk::ToggleButton::builder()
+                .icon_name("go-previous-symbolic")
+                .tooltip_text("Show message list")
+                .visible(false)
+                .build();
+            header.pack_start(&sidebar_button);
 
             // Action buttons in header bar
             let star_button = gtk::ToggleButton::builder()
@@ -347,6 +358,7 @@ mod imp {
             *self.load_images_button.borrow_mut() = Some(load_images_button);
             *self.always_load_button.borrow_mut() = Some(always_load_button);
             *self.tracking_label.borrow_mut() = Some(tracking_label);
+            *self.sidebar_button.borrow_mut() = Some(sidebar_button);
         }
     }
 
@@ -558,6 +570,11 @@ impl MqMessageView {
         if let Some(btn) = self.imp().always_load_button.borrow().as_ref() {
             btn.connect_clicked(move |_| f());
         }
+    }
+
+    /// Get the sidebar toggle button (for binding to an OverlaySplitView).
+    pub fn sidebar_button(&self) -> Option<gtk::ToggleButton> {
+        self.imp().sidebar_button.borrow().clone()
     }
 
     fn find_stack(&self) -> Option<gtk::Stack> {

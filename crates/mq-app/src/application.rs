@@ -24,6 +24,13 @@ pub fn run() -> i32 {
 
     app.connect_startup(|_app| {
         info!("Application startup");
+
+        // Register bundled fallback icons as a GResource.
+        // These are treated as hicolor fallback — the user's icon theme is
+        // always checked first. Only if an icon isn't found anywhere in the
+        // theme's inheritance chain do these kick in.
+        register_bundled_icons();
+
         load_css();
     });
 
@@ -368,8 +375,8 @@ fn setup_ui(window: MqWindow, data: AppData) {
 // ---------------------------------------------------------------------------
 
 fn show_account_setup(window: &MqWindow, pool: &Arc<SqlitePool>) {
-    let dialog = MqAccountSetup::new(window);
-    dialog.present();
+    let dialog = MqAccountSetup::new();
+    dialog.present(Some(window));
 
     let dialog_ref = dialog.clone();
     let pool = pool.clone();
@@ -1424,6 +1431,48 @@ fn remove_selected(list: &crate::widgets::message_list::MqMessageList) {
     if pos < model.n_items() {
         model.remove(pos);
     }
+}
+
+/// Register bundled symbolic icons as fallback.
+///
+/// Many icon themes (e.g. Papirus-Dark) don't include `-symbolic` icon variants
+/// or don't inherit from a theme that does. We ship a small set of standard
+/// symbolic icons and add them as a search path. GTK treats additional search
+/// paths as fallback — the user's theme is always checked first.
+fn register_bundled_icons() {
+    let display = match gtk::gdk::Display::default() {
+        Some(d) => d,
+        None => return,
+    };
+    let icon_theme = gtk::IconTheme::for_display(&display);
+
+    // Check candidate locations for the bundled icons directory:
+    // 1. Relative to the binary (development: project_root/data/icons)
+    // 2. Installed location (prefix/share/mq-mail/icons)
+    let candidates = [
+        // Development: binary is in target/debug/, icons are in data/icons
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent()?.parent()?.parent().map(|p| p.join("data/icons"))),
+        // Installed via Nix or Meson: prefix/share/mq-mail/icons
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent()?.parent().map(|p| p.join("share/mq-mail/icons"))),
+        // Flatpak / system install
+        Some(std::path::PathBuf::from("/app/share/mq-mail/icons")),
+    ];
+
+    for candidate in &candidates {
+        if let Some(path) = candidate {
+            if path.join("hicolor/index.theme").exists() {
+                info!("Adding bundled icon path: {}", path.display());
+                icon_theme.add_search_path(path);
+                return;
+            }
+        }
+    }
+
+    debug!("No bundled icon directory found (icons will come from system theme only)");
 }
 
 fn load_css() {
