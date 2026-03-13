@@ -16,6 +16,9 @@ mod imp {
         pub model: RefCell<Option<gio::ListStore>>,
         pub selection: RefCell<Option<gtk::SingleSelection>>,
         pub compose_button: RefCell<Option<gtk::Button>>,
+        pub search_bar: RefCell<Option<gtk::SearchBar>>,
+        pub search_entry: RefCell<Option<gtk::SearchEntry>>,
+        pub search_button: RefCell<Option<gtk::ToggleButton>>,
     }
 
     #[glib::object_subclass]
@@ -47,7 +50,33 @@ mod imp {
                 .build();
             header.pack_end(&compose_button);
 
+            let search_button = gtk::ToggleButton::builder()
+                .icon_name("system-search-symbolic")
+                .tooltip_text("Search")
+                .build();
+            header.pack_end(&search_button);
+
             widget.append(&header);
+
+            // Search bar (revealed when search button is toggled)
+            let search_entry = gtk::SearchEntry::builder()
+                .placeholder_text("Search messages...")
+                .hexpand(true)
+                .build();
+
+            let search_bar = gtk::SearchBar::builder()
+                .child(&search_entry)
+                .build();
+            search_bar.connect_entry(&search_entry);
+
+            // Bind the toggle button to the search bar
+            search_button
+                .bind_property("active", &search_bar, "search-mode-enabled")
+                .bidirectional()
+                .sync_create()
+                .build();
+
+            widget.append(&search_bar);
 
             // Create the list model
             let model = gio::ListStore::new::<MessageObject>();
@@ -101,6 +130,9 @@ mod imp {
             *self.model.borrow_mut() = Some(model);
             *self.selection.borrow_mut() = Some(selection);
             *self.compose_button.borrow_mut() = Some(compose_button);
+            *self.search_bar.borrow_mut() = Some(search_bar);
+            *self.search_entry.borrow_mut() = Some(search_entry);
+            *self.search_button.borrow_mut() = Some(search_button);
         }
     }
 
@@ -354,6 +386,38 @@ impl MqMessageList {
                 }
             }
         });
+    }
+
+    /// Connect a callback for when a search is submitted.
+    ///
+    /// The callback receives the search query string.
+    pub fn connect_search_activated<F: Fn(String) + 'static>(&self, f: F) {
+        if let Some(entry) = self.imp().search_entry.borrow().as_ref() {
+            entry.connect_activate(move |entry| {
+                let text = entry.text().to_string();
+                f(text);
+            });
+        }
+    }
+
+    /// Connect a callback for when the search text changes (for live search).
+    ///
+    /// The callback receives the search query string. An empty string means
+    /// the search was cleared and the normal view should be restored.
+    pub fn connect_search_changed<F: Fn(String) + 'static>(&self, f: F) {
+        if let Some(entry) = self.imp().search_entry.borrow().as_ref() {
+            entry.connect_search_changed(move |entry| {
+                let text = entry.text().to_string();
+                f(text);
+            });
+        }
+    }
+
+    /// Programmatically close the search bar.
+    pub fn close_search(&self) {
+        if let Some(btn) = self.imp().search_button.borrow().as_ref() {
+            btn.set_active(false);
+        }
     }
 }
 

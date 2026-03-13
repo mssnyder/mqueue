@@ -296,6 +296,49 @@ fn setup_ui(window: MqWindow, data: AppData) {
         });
     }
 
+    // Load and display labels in sidebar
+    {
+        let sidebar = window.sidebar();
+        let pool = pool.clone();
+        let account_ids: Vec<i64> = data.accounts.iter().map(|a| a.id).collect();
+        runtime::spawn_async(
+            async move {
+                let mut all_labels: Vec<(String, String)> = Vec::new();
+                for aid in &account_ids {
+                    let labels = mq_db::queries::labels::get_user_labels(&pool, *aid)
+                        .await
+                        .unwrap_or_default();
+                    for label in labels {
+                        let entry = (label.name.clone(), label.imap_name.clone());
+                        if !all_labels.contains(&entry) {
+                            all_labels.push(entry);
+                        }
+                    }
+                }
+                all_labels
+            },
+            move |labels: Vec<(String, String)>| {
+                sidebar.set_labels(&labels);
+            },
+        );
+    }
+
+    // Wire sidebar: label selection → reload messages for that label
+    {
+        let w = window.clone();
+        let p = pool.clone();
+        let e = account_emails.clone();
+        let m = shared_messages.clone();
+        let n = data.accounts.len();
+        window.sidebar().connect_label_selected(move |label_imap_name| {
+            let account_id = w.sidebar().selected_account_id();
+            reload_messages(&w, &p, account_id, label_imap_name, &e, n > 1, &m);
+        });
+    }
+
+    // Wire search bar
+    wire_search(&window, &pool, &account_emails, is_multi_account, &shared_messages);
+
     // Wire network awareness (offline banner + reconnect)
     wire_network_awareness(&window, &pool, &account_emails, is_multi_account, &shared_messages);
 }
@@ -978,6 +1021,94 @@ fn wire_privacy_buttons(
             }
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+fn wire_search(
+    window: &MqWindow,
+    pool: &Arc<SqlitePool>,
+    account_emails: &Arc<HashMap<i64, String>>,
+    is_multi_account: bool,
+    shared_messages: &Rc<RefCell<Vec<MessageData>>>,
+) {
+    let ml = window.message_list();
+    let w = window.clone();
+    let p = pool.clone();
+    let e = account_emails.clone();
+    let m = shared_messages.clone();
+
+    // When search is activated (Enter pressed), perform FTS search
+    ml.connect_search_activated(move |query| {
+        if query.trim().is_empty() {
+            // Empty search → restore normal mailbox view
+            let mailbox = w.sidebar().selected_mailbox();
+            let account_id = w.sidebar().selected_account_id();
+            reload_messages(&w, &p, account_id, &mailbox, &e, is_multi_account, &m);
+            return;
+        }
+
+        let pool = p.clone();
+        let emails = e.clone();
+        let msgs = m.clone();
+        let ml_inner = w.message_list();
+        let mv = w.message_view();
+        let query_owned = query.clone();
+        let account_id = w.sidebar().selected_account_id();
+        let show_badge = is_multi_account && account_id.is_none();
+
+        runtime::spawn_async(
+            async move {
+                let messages = match account_id {
+                    Some(aid) => {
+                        mq_db::queries::messages::search_fts_for_account(
+                            &pool, aid, &query_owned, 200,
+                        )
+                        .await
+                    }
+                    None => {
+                        mq_db::queries::messages::search_fts(&pool, &query_owned, 200).await
+                    }
+                };
+
+                match messages {
+                    Ok(msgs) => Ok((db_to_message_data(msgs), emails, show_badge)),
+                    Err(e) => Err(format!("Search failed: {e}")),
+                }
+            },
+            move |result: Result<
+                (Vec<MessageData>, Arc<HashMap<i64, String>>, bool),
+                String,
+            >| match result {
+                Ok((messages, emails, show_badge)) => {
+                    let objects = make_message_objects(&messages, &emails, show_badge);
+                    *msgs.borrow_mut() = messages;
+                    ml_inner.set_messages(objects);
+                    ml_inner.set_mailbox_title("Search Results");
+                    mv.show_placeholder();
+                }
+                Err(e) => {
+                    warn!("Search error: {e}");
+                }
+            },
+        );
+    });
+
+    // When search text is cleared, restore normal view
+    let w2 = window.clone();
+    let p2 = pool.clone();
+    let e2 = account_emails.clone();
+    let m2 = shared_messages.clone();
+
+    window.message_list().connect_search_changed(move |query| {
+        if query.is_empty() {
+            let mailbox = w2.sidebar().selected_mailbox();
+            let account_id = w2.sidebar().selected_account_id();
+            reload_messages(&w2, &p2, account_id, &mailbox, &e2, is_multi_account, &m2);
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

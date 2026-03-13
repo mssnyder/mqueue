@@ -75,3 +75,62 @@ pub async fn update_label_counts(
         .await?;
     Ok(())
 }
+
+/// Get all labels applied to a specific message.
+pub async fn get_labels_for_message(
+    pool: &SqlitePool,
+    message_id: i64,
+) -> sqlx::Result<Vec<DbLabel>> {
+    sqlx::query_as::<_, DbLabel>(
+        "SELECT l.id, l.account_id, l.name, l.imap_name, l.label_type, l.color, l.unread_count, l.total_count
+        FROM labels l
+        JOIN message_labels ml ON ml.label_id = l.id
+        WHERE ml.message_id = ?
+        ORDER BY l.name",
+    )
+    .bind(message_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Get user-defined labels for an account (excludes system labels).
+pub async fn get_user_labels(
+    pool: &SqlitePool,
+    account_id: i64,
+) -> sqlx::Result<Vec<DbLabel>> {
+    sqlx::query_as::<_, DbLabel>(
+        "SELECT id, account_id, name, imap_name, label_type, color, unread_count, total_count
+        FROM labels
+        WHERE account_id = ? AND label_type = 'user'
+        ORDER BY name",
+    )
+    .bind(account_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Delete a label and all its message associations.
+pub async fn delete_label(pool: &SqlitePool, label_id: i64) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM labels WHERE id = ?")
+        .bind(label_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Find a label by name for a given account.
+pub async fn find_label_by_name(
+    pool: &SqlitePool,
+    account_id: i64,
+    name: &str,
+) -> sqlx::Result<Option<DbLabel>> {
+    sqlx::query_as::<_, DbLabel>(
+        "SELECT id, account_id, name, imap_name, label_type, color, unread_count, total_count
+        FROM labels
+        WHERE account_id = ? AND name = ?",
+    )
+    .bind(account_id)
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+}

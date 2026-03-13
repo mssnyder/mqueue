@@ -1,6 +1,7 @@
 //! Parse IMAP FETCH responses into domain types.
 
 use crate::email::{Address, Email, MessageFlags};
+use crate::imap::gmail_ext;
 
 /// Parse an async-imap `Fetch` response into our `Email` domain type.
 pub fn parse_fetch(fetch: &async_imap::types::Fetch) -> Option<Email> {
@@ -79,10 +80,16 @@ pub fn parse_fetch(fetch: &async_imap::types::Fetch) -> Option<Email> {
             .map(parse_unsub_headers)
             .unwrap_or((None, None));
 
+    // Extract Gmail extensions from the raw FETCH response.
+    // async-imap doesn't parse these natively, so we use the Debug
+    // representation to find them in the response data.
+    let raw = format!("{:?}", fetch);
+    let gmail_meta = gmail_ext::extract_gmail_metadata_from_raw(&raw);
+
     Some(Email {
         uid,
-        gmail_msg_id: None, // Requires X-GM-MSGID extension (Phase 7)
-        gmail_thread_id: None, // Requires X-GM-THRID extension (Phase 7)
+        gmail_msg_id: gmail_meta.gmail_msg_id,
+        gmail_thread_id: gmail_meta.gmail_thread_id,
         message_id,
         in_reply_to,
         references: vec![], // Parsed from full headers when body is fetched
@@ -94,7 +101,7 @@ pub fn parse_fetch(fetch: &async_imap::types::Fetch) -> Option<Email> {
         date,
         snippet: None, // Generated when body is fetched
         flags,
-        labels: vec![], // Requires X-GM-LABELS extension (Phase 7)
+        labels: gmail_meta.labels,
         has_attachments: false, // Determined from BODYSTRUCTURE (TODO)
         list_unsubscribe,
         list_unsubscribe_post,

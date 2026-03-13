@@ -1,6 +1,7 @@
 //! Search abstraction.
 //!
-//! Routes to X-GM-RAW (server-side Gmail search) when online,
-//! falls back to local SQLite FTS5 when offline.
+//! Provides server-side Gmail search via X-GM-RAW. Local FTS5 search
+//! is handled directly through `mq_db::queries::messages::search_fts`.
+//! The app layer routes between server and local search based on connectivity.
 
-// TODO: Implement in Phase 7.
+pub use crate::imap::gmail_ext::search_gmail;

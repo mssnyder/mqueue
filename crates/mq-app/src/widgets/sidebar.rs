@@ -12,6 +12,9 @@ mod imp {
     pub struct MqSidebar {
         pub account_list: RefCell<Option<gtk::ListBox>>,
         pub mailbox_list: RefCell<Option<gtk::ListBox>>,
+        pub label_list: RefCell<Option<gtk::ListBox>>,
+        pub labels_header: RefCell<Option<gtk::Label>>,
+        pub labels_separator: RefCell<Option<gtk::Separator>>,
         pub add_account_button: RefCell<Option<gtk::Button>>,
         pub selected_mailbox: RefCell<String>,
         /// None = All Accounts, Some(id) = specific account.
@@ -145,11 +148,38 @@ mod imp {
 
             content.append(&mailbox_list);
 
+            // Separator before labels
+            let labels_sep = gtk::Separator::new(gtk::Orientation::Horizontal);
+            labels_sep.set_visible(false); // hidden until labels are loaded
+            content.append(&labels_sep);
+
+            // --- Labels section (populated dynamically) ---
+            let labels_header = gtk::Label::builder()
+                .label("Labels")
+                .xalign(0.0)
+                .css_classes(["dim-label", "caption", "heading"])
+                .margin_top(8)
+                .margin_bottom(4)
+                .margin_start(16)
+                .visible(false) // hidden until labels are loaded
+                .build();
+            content.append(&labels_header);
+
+            let label_list = gtk::ListBox::builder()
+                .selection_mode(gtk::SelectionMode::Single)
+                .css_classes(["navigation-sidebar"])
+                .visible(false) // hidden until labels are loaded
+                .build();
+            content.append(&label_list);
+
             scrolled.set_child(Some(&content));
             widget.append(&scrolled);
 
             *self.account_list.borrow_mut() = Some(account_list);
             *self.mailbox_list.borrow_mut() = Some(mailbox_list);
+            *self.label_list.borrow_mut() = Some(label_list);
+            *self.labels_header.borrow_mut() = Some(labels_header);
+            *self.labels_separator.borrow_mut() = Some(labels_sep);
             *self.add_account_button.borrow_mut() = Some(add_button);
         }
     }
@@ -319,6 +349,55 @@ impl MqSidebar {
     /// Get the currently selected account ID (None = All Accounts).
     pub fn selected_account_id(&self) -> Option<i64> {
         *self.imp().selected_account_id.borrow()
+    }
+
+    /// Populate the labels list with user-defined labels.
+    ///
+    /// Each tuple is (label_name, imap_name). The labels section is shown
+    /// only when there are labels to display.
+    pub fn set_labels(&self, labels: &[(String, String)]) {
+        let imp = self.imp();
+
+        let has_labels = !labels.is_empty();
+
+        if let Some(header) = imp.labels_header.borrow().as_ref() {
+            header.set_visible(has_labels);
+        }
+        if let Some(sep) = imp.labels_separator.borrow().as_ref() {
+            sep.set_visible(has_labels);
+        }
+        if let Some(list_box) = imp.label_list.borrow().as_ref() {
+            list_box.set_visible(has_labels);
+
+            // Clear existing rows
+            while let Some(row) = list_box.row_at_index(0) {
+                list_box.remove(&row);
+            }
+
+            for (name, imap_name) in labels {
+                let row = imp::MqSidebar::create_mailbox_row(
+                    "tag-symbolic",
+                    name,
+                    imap_name,
+                );
+                list_box.append(&row);
+            }
+        }
+    }
+
+    /// Connect a callback for when a label is selected.
+    ///
+    /// The callback receives the label's IMAP name.
+    pub fn connect_label_selected<F: Fn(&str) + 'static>(&self, f: F) {
+        let imp = self.imp();
+        if let Some(list_box) = imp.label_list.borrow().as_ref() {
+            list_box.connect_row_selected(move |_, row| {
+                if let Some(row) = row {
+                    let label = row.widget_name();
+                    f(label.as_str());
+                }
+            });
+        }
     }
 }
 

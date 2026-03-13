@@ -91,7 +91,7 @@ impl ImapSession {
             .session
             .uid_fetch(
                 uid_range,
-                "(UID FLAGS ENVELOPE BODY.PEEK[HEADER.FIELDS (LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST)] BODYSTRUCTURE)",
+                "(UID FLAGS ENVELOPE X-GM-MSGID X-GM-THRID X-GM-LABELS BODY.PEEK[HEADER.FIELDS (LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST)] BODYSTRUCTURE)",
             )
             .await?
             .try_collect()

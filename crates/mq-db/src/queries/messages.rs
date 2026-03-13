@@ -199,3 +199,141 @@ pub async fn search_fts(
     .fetch_all(pool)
     .await
 }
+
+/// FTS5 search scoped to a single account.
+pub async fn search_fts_for_account(
+    pool: &SqlitePool,
+    account_id: i64,
+    query: &str,
+    limit: i64,
+) -> sqlx::Result<Vec<DbMessage>> {
+    sqlx::query_as::<_, DbMessage>(
+        "SELECT m.id, m.account_id, m.uid, m.mailbox, m.gmail_msg_id, m.gmail_thread_id,
+            m.message_id, m.in_reply_to, m.references_json,
+            m.sender_name, m.sender_email, m.recipient_to, m.recipient_cc,
+            m.subject, m.snippet, m.date, m.flags, m.has_attachments, m.body_structure,
+            m.list_unsubscribe, m.list_unsubscribe_post, m.modseq, m.uid_validity, m.cached_at
+        FROM messages m
+        JOIN messages_fts ON messages_fts.rowid = m.id
+        WHERE messages_fts MATCH ? AND m.account_id = ?
+        ORDER BY rank
+        LIMIT ?",
+    )
+    .bind(query)
+    .bind(account_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Resolve IMAP UIDs to local database message IDs.
+///
+/// Used by server-side search to map Gmail X-GM-RAW results back to local rows.
+pub async fn resolve_uids_to_ids(
+    pool: &SqlitePool,
+    account_id: Option<i64>,
+    uids: &[u32],
+) -> sqlx::Result<Vec<i64>> {
+    if uids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Build a comma-separated list of UID placeholders
+    let placeholders: Vec<String> = uids.iter().map(|_| "?".to_string()).collect();
+    let placeholder_str = placeholders.join(",");
+
+    let sql = match account_id {
+        Some(_) => format!(
+            "SELECT id FROM messages WHERE account_id = ? AND uid IN ({placeholder_str}) ORDER BY date DESC"
+        ),
+        None => format!(
+            "SELECT id FROM messages WHERE uid IN ({placeholder_str}) ORDER BY date DESC"
+        ),
+    };
+
+    let mut query = sqlx::query_scalar::<_, i64>(&sql);
+
+    if let Some(aid) = account_id {
+        query = query.bind(aid);
+    }
+
+    for uid in uids {
+        query = query.bind(*uid as i64);
+    }
+
+    query.fetch_all(pool).await
+}
+
+/// Get messages by a list of database IDs.
+pub async fn get_messages_by_ids(
+    pool: &SqlitePool,
+    ids: &[i64],
+) -> sqlx::Result<Vec<DbMessage>> {
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
+    let placeholder_str = placeholders.join(",");
+
+    let sql = format!(
+        "SELECT id, account_id, uid, mailbox, gmail_msg_id, gmail_thread_id,
+            message_id, in_reply_to, references_json,
+            sender_name, sender_email, recipient_to, recipient_cc,
+            subject, snippet, date, flags, has_attachments, body_structure,
+            list_unsubscribe, list_unsubscribe_post, modseq, uid_validity, cached_at
+        FROM messages
+        WHERE id IN ({placeholder_str})
+        ORDER BY date DESC"
+    );
+
+    let mut query = sqlx::query_as::<_, DbMessage>(&sql);
+    for id in ids {
+        query = query.bind(id);
+    }
+
+    query.fetch_all(pool).await
+}
+
+/// Update the FTS body_text for a message (called when body is fetched).
+pub async fn update_fts_body_text(
+    pool: &SqlitePool,
+    message_id: i64,
+    body_text: &str,
+) -> sqlx::Result<()> {
+    // The FTS5 content-sync triggers handle INSERT/DELETE, but we need to
+    // manually update body_text since it's not in the messages table.
+    // We do a DELETE + INSERT to update the FTS entry.
+    sqlx::query(
+        "INSERT INTO messages_fts(messages_fts, rowid, subject, sender_name, sender_email, snippet, body_text)
+         VALUES('delete', ?, (SELECT subject FROM messages WHERE id = ?),
+                (SELECT sender_name FROM messages WHERE id = ?),
+                (SELECT sender_email FROM messages WHERE id = ?),
+                (SELECT snippet FROM messages WHERE id = ?), '')"
+    )
+    .bind(message_id)
+    .bind(message_id)
+    .bind(message_id)
+    .bind(message_id)
+    .bind(message_id)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO messages_fts(rowid, subject, sender_name, sender_email, snippet, body_text)
+         VALUES(?, (SELECT subject FROM messages WHERE id = ?),
+                (SELECT sender_name FROM messages WHERE id = ?),
+                (SELECT sender_email FROM messages WHERE id = ?),
+                (SELECT snippet FROM messages WHERE id = ?), ?)"
+    )
+    .bind(message_id)
+    .bind(message_id)
+    .bind(message_id)
+    .bind(message_id)
+    .bind(message_id)
+    .bind(body_text)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
