@@ -7,6 +7,11 @@ mod runtime;
 mod widgets;
 
 fn main() {
+    // Ensure GSettings schemas (e.g. EmojiChooser) are discoverable.
+    // On systems like NixOS, schemas live outside the default search path.
+    // The build.rs records the GTK4 prefix via pkg-config so we can add it.
+    ensure_gsettings_schemas();
+
     // Initialize logging
     init_logging();
 
@@ -63,4 +68,67 @@ fn init_logging() {
     }
 
     registry.init();
+}
+
+/// Add the GTK4 schema directory to `XDG_DATA_DIRS` if it isn't already
+/// reachable. This prevents a fatal GLib error when GTK widgets try to
+/// access schemas (e.g. EmojiChooser) that aren't in the default path.
+fn ensure_gsettings_schemas() {
+    // If the user (or a wrapper like wrapGAppsHook4) already set the schema
+    // dir, trust it.
+    if std::env::var_os("GSETTINGS_SCHEMA_DIR").is_some() {
+        return;
+    }
+
+    // build.rs embeds the GTK4 prefix discovered at compile time.
+    let Some(prefix) = option_env!("MQ_GTK4_PREFIX") else {
+        return;
+    };
+
+    // On NixOS the schemas live under a `gsettings-schemas/<name>/` subtree,
+    // while on FHS systems they are directly under `<prefix>/share/`.
+    // Check both layouts and add whichever exists to XDG_DATA_DIRS.
+    let share = format!("{prefix}/share");
+    let candidates = [
+        // NixOS layout: <prefix>/share/gsettings-schemas/*/glib-2.0/schemas/
+        find_nix_schema_datadir(&share),
+        // FHS layout: <prefix>/share/glib-2.0/schemas/
+        Some(share.clone()),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        let schema_dir = format!("{candidate}/glib-2.0/schemas");
+        if std::path::Path::new(&schema_dir).join("gschemas.compiled").exists() {
+            prepend_xdg_data_dirs(&candidate);
+            return;
+        }
+    }
+}
+
+/// On NixOS, schemas are at `<share>/gsettings-schemas/<name>/`.
+/// Return the `<share>/gsettings-schemas/<name>` path if found.
+fn find_nix_schema_datadir(share: &str) -> Option<String> {
+    let schemas_dir = format!("{share}/gsettings-schemas");
+    let dir = std::fs::read_dir(&schemas_dir).ok()?;
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if path.join("glib-2.0/schemas/gschemas.compiled").exists() {
+            return Some(path.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+fn prepend_xdg_data_dirs(datadir: &str) {
+    let current = std::env::var("XDG_DATA_DIRS").unwrap_or_default();
+    if current.split(':').any(|p| p == datadir) {
+        return; // Already present
+    }
+    let new_val = if current.is_empty() {
+        // Preserve the default /usr/share fallback per XDG spec
+        format!("{datadir}:/usr/local/share:/usr/share")
+    } else {
+        format!("{datadir}:{current}")
+    };
+    unsafe { std::env::set_var("XDG_DATA_DIRS", new_val) };
 }

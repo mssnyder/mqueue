@@ -1495,8 +1495,11 @@ fn strip_html_wrapper(html: &str) -> String {
 
 /// Make a short snippet for a collapsed thread card.
 fn make_card_snippet(body: &str) -> String {
-    let trimmed: String = body.split_whitespace().take(20).collect::<Vec<_>>().join(" ");
-    if trimmed.len() < body.len() {
+    let mut words = body.split_whitespace();
+    let first_20: Vec<&str> = words.by_ref().take(20).collect();
+    let truncated = words.next().is_some();
+    let trimmed = first_20.join(" ");
+    if truncated {
         format!("{trimmed}\u{2026}")
     } else {
         trimmed
@@ -1516,13 +1519,11 @@ fn split_plain_text_quote(text: &str) -> (&str, Option<&str>) {
         if (lower.contains("wrote:") || lower.contains("schrieb:"))
             && (lower.starts_with("on ") || lower.starts_with("am "))
         {
-            // Find the byte offset of this line in the original text
-            let offset = text
-                .find(line)
-                .unwrap_or(text.len());
-            if offset < text.len() {
-                return (&text[..offset], Some(&text[offset..]));
-            }
+            // Compute byte offset via pointer arithmetic — lines() returns
+            // subslices of `text`, so this is always correct (unlike find()
+            // which would match the first occurrence of the same content).
+            let offset = line.as_ptr() as usize - text.as_ptr() as usize;
+            return (&text[..offset], Some(&text[offset..]));
         }
 
         // Outlook-style "From: ... Sent: ... Subject: ..." header block
@@ -1531,10 +1532,8 @@ fn split_plain_text_quote(text: &str) -> (&str, Option<&str>) {
             let remaining_lines = &lines[i..lines.len().min(i + 6)];
             let remaining_lower: String = remaining_lines.join("\n").to_lowercase();
             if remaining_lower.contains("sent:") && remaining_lower.contains("subject:") {
-                let offset = text.find(line).unwrap_or(text.len());
-                if offset < text.len() {
-                    return (&text[..offset], Some(&text[offset..]));
-                }
+                let offset = line.as_ptr() as usize - text.as_ptr() as usize;
+                return (&text[..offset], Some(&text[offset..]));
             }
         }
 
@@ -1544,10 +1543,8 @@ fn split_plain_text_quote(text: &str) -> (&str, Option<&str>) {
             && lines[i + 1].starts_with("&gt; ")
             && lines[i + 2].starts_with("&gt; ")
         {
-            let offset = text.find(line).unwrap_or(text.len());
-            if offset < text.len() {
-                return (&text[..offset], Some(&text[offset..]));
-            }
+            let offset = line.as_ptr() as usize - text.as_ptr() as usize;
+            return (&text[..offset], Some(&text[offset..]));
         }
     }
 

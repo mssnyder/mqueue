@@ -152,53 +152,95 @@ pub fn setup_actions(app: &adw::Application, window: &crate::widgets::window::Mq
 }
 
 /// Show the keyboard shortcuts window.
+///
+/// Uses a plain adw::Window instead of gtk::ShortcutsWindow because the
+/// latter segfaults on close with some GTK4 builds / Wayland compositors.
 fn show_shortcuts_window(window: &crate::widgets::window::MqWindow) {
-    let section = gtk::ShortcutsSection::builder()
-        .section_name("shortcuts")
-        .max_height(10)
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .margin_top(12)
+        .margin_bottom(24)
+        .margin_start(24)
+        .margin_end(24)
         .build();
 
-    // General group
-    let general_group = gtk::ShortcutsGroup::builder()
-        .title("General")
-        .build();
-    add_shortcut(&general_group, "<Control>n", "Compose new message");
-    add_shortcut(&general_group, "<Control>f", "Search messages");
-    add_shortcut(&general_group, "Escape", "Close search / compose");
-    add_shortcut(&general_group, "<Control>comma", "Preferences");
-    add_shortcut(&general_group, "<Control>q", "Quit");
-    add_shortcut(&general_group, "<Control>question", "Keyboard shortcuts");
-    section.append(&general_group);
+    // General shortcuts
+    add_shortcut_section(&content, "General", &[
+        ("Ctrl+N", "Compose new message"),
+        ("Ctrl+F", "Search messages"),
+        ("Escape", "Close search / compose"),
+        ("Ctrl+,", "Preferences"),
+        ("Ctrl+Q", "Quit"),
+        ("Ctrl+?", "Keyboard shortcuts"),
+    ]);
 
-    // Messages group
-    let messages_group = gtk::ShortcutsGroup::builder()
-        .title("Messages")
-        .build();
-    add_shortcut(&messages_group, "r", "Reply");
-    add_shortcut(&messages_group, "<Shift>r", "Reply all");
-    add_shortcut(&messages_group, "<Shift>f", "Forward");
-    add_shortcut(&messages_group, "Delete", "Delete");
-    add_shortcut(&messages_group, "e", "Archive");
-    add_shortcut(&messages_group, "s", "Star");
-    add_shortcut(&messages_group, "<Shift>u", "Toggle read/unread");
-    add_shortcut(&messages_group, "j", "Next message");
-    add_shortcut(&messages_group, "k", "Previous message");
-    section.append(&messages_group);
+    // Message shortcuts
+    add_shortcut_section(&content, "Messages", &[
+        ("R", "Reply"),
+        ("Shift+R", "Reply all"),
+        ("Shift+F", "Forward"),
+        ("Delete", "Delete"),
+        ("E", "Archive"),
+        ("S", "Star"),
+        ("Shift+U", "Toggle read/unread"),
+        ("J", "Next message"),
+        ("K", "Previous message"),
+    ]);
 
-    let shortcuts_window = gtk::ShortcutsWindow::builder()
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .child(&content)
+        .build();
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&scrolled));
+
+    let dialog = adw::Window::builder()
+        .title("Keyboard Shortcuts")
         .transient_for(window)
         .modal(true)
-        .child(&section)
+        .default_width(400)
+        .default_height(480)
+        .content(&toolbar)
         .build();
-    shortcuts_window.present();
+    dialog.present();
 }
 
-fn add_shortcut(group: &gtk::ShortcutsGroup, accel: &str, title: &str) {
-    let shortcut = gtk::ShortcutsShortcut::builder()
-        .accelerator(accel)
-        .title(title)
+/// Add a titled group of shortcut rows to a container.
+fn add_shortcut_section(container: &gtk::Box, title: &str, shortcuts: &[(&str, &str)]) {
+    let heading = gtk::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .css_classes(["heading"])
+        .margin_top(12)
         .build();
-    group.append(&shortcut);
+    container.append(&heading);
+
+    for (key, desc) in shortcuts {
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .build();
+
+        let key_label = gtk::Label::builder()
+            .label(*key)
+            .width_chars(12)
+            .xalign(1.0)
+            .css_classes(["dim-label", "caption", "monospace"])
+            .build();
+        let desc_label = gtk::Label::builder()
+            .label(*desc)
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+
+        row.append(&key_label);
+        row.append(&desc_label);
+        container.append(&row);
+    }
 }
 
 /// Show the About dialog.

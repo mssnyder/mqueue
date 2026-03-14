@@ -142,6 +142,11 @@
             # wrapGAppsHook4 sets these for the built binary, but cargo run
             # runs unwrapped, so we set them here for development.
             export GIO_EXTRA_MODULES="${pkgs.glib-networking}/lib/gio/modules''${GIO_EXTRA_MODULES:+:$GIO_EXTRA_MODULES}"
+
+            # GTK4 GSettings schemas (EmojiChooser, FileChooser, etc.) must
+            # be in XDG_DATA_DIRS for cargo run to work.
+            export XDG_DATA_DIRS="${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}:${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.glib.out}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}:/usr/local/share:/usr/share"
+
             echo "m'Queue dev shell ready (Rust $(rustc --version)). Run 'cargo build' to build."
           '';
         };

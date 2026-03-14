@@ -78,9 +78,11 @@ mod imp {
         /// Callback to save the compose content as a draft.
         pub save_draft_callback: RefCell<Option<Box<dyn Fn(&super::MqComposeWindow)>>>,
         /// Cached body HTML from the rich text editor WebView.
-        pub cached_body_html: RefCell<String>,
+        pub cached_body_html: std::rc::Rc<RefCell<String>>,
         /// The rich text editor WebView (replaces body_view when active).
-        pub body_webview: RefCell<Option<webkit6::WebView>>,
+        pub body_webview: std::rc::Rc<RefCell<Option<webkit6::WebView>>>,
+        /// Format toolbar buttons keyed by command name, for state highlighting.
+        pub fmt_buttons: Rc<RefCell<Vec<(String, gtk::Button)>>>,
     }
 
     impl std::fmt::Debug for MqComposeWindow {
@@ -102,7 +104,7 @@ mod imp {
 
             let window = self.obj();
             window.set_title(Some("New Message"));
-            window.set_default_size(640, 500);
+            window.set_default_size(660, 500);
             window.set_size_request(360, 350);
 
             let main_box = gtk::Box::builder()
@@ -232,15 +234,39 @@ mod imp {
             body_webview.set_vexpand(true);
             body_webview.set_hexpand(true);
 
-            // Register script message handler for body content caching
+            // Register a single script message handler for all editor updates.
+            // Messages prefixed with "html:" carry body content; "fmt:" carry
+            // formatting state for toolbar button highlighting.
             let ucm = body_webview.user_content_manager().unwrap();
-            ucm.register_script_message_handler("bodyChanged", None);
-            let cached_html = self.cached_body_html.clone();
-            ucm.connect_script_message_received(Some("bodyChanged"), move |_ucm, value| {
-                let html: String = format!("{}", value);
-                // Remove wrapping quotes from JS string
-                let html = html.trim_matches('"').to_string();
-                *cached_html.borrow_mut() = html;
+            ucm.register_script_message_handler("mqUpdate", None);
+            let cached_html = std::rc::Rc::clone(&self.cached_body_html);
+            let fmt_btns = Rc::clone(&self.fmt_buttons);
+            ucm.connect_script_message_received(None, move |_ucm, value| {
+                let msg: String = format!("{}", value);
+                let msg = msg.trim_matches('"');
+                if let Some(html) = msg.strip_prefix("html:") {
+                    *cached_html.borrow_mut() = html.to_string();
+                } else if let Some(state) = msg.strip_prefix("fmt:") {
+                    let parts: Vec<&str> = state.split(',').collect();
+                    if parts.len() < 5 { return; }
+                    let block = parts[4];
+
+                    for (key, btn) in fmt_btns.borrow().iter() {
+                        let active = match key.as_str() {
+                            "bold" => parts[0] == "bold",
+                            "italic" => parts[1] == "italic",
+                            "underline" => parts[2] == "underline",
+                            "strikeThrough" => parts[3] == "strikeThrough",
+                            "h1" | "h2" | "h3" | "pre" => block == key,
+                            _ => false,
+                        };
+                        if active {
+                            btn.add_css_class("fmt-active");
+                        } else {
+                            btn.remove_css_class("fmt-active");
+                        }
+                    }
+                }
             });
 
             // Detect dark mode for editor styling
@@ -291,13 +317,43 @@ h2 {{ font-size: 1.3em; margin: 0.4em 0; }}
 h3 {{ font-size: 1.1em; margin: 0.4em 0; }}
 a {{ color: #1a73e8; }}
 ul, ol {{ padding-left: 24px; }}
-</style></head>
-<body contenteditable="true" spellcheck="true"></body>
+</style>
 <script>
-document.body.addEventListener('input', function() {{
-    window.webkit.messageHandlers.bodyChanged.postMessage(document.body.innerHTML);
+document.addEventListener('DOMContentLoaded', function() {{
+    var mq = window.webkit.messageHandlers.mqUpdate;
+    function sendFormatState() {{
+        var block = document.queryCommandValue('formatBlock');
+        mq.postMessage('fmt:' + [
+            document.queryCommandState('bold') ? 'bold' : '',
+            document.queryCommandState('italic') ? 'italic' : '',
+            document.queryCommandState('underline') ? 'underline' : '',
+            document.queryCommandState('strikeThrough') ? 'strikeThrough' : '',
+            block
+        ].join(','));
+    }}
+    document.body.addEventListener('input', function() {{
+        mq.postMessage('html:' + document.body.innerHTML);
+        sendFormatState();
+    }});
+    document.addEventListener('selectionchange', function() {{
+        var sel = window.getSelection();
+        if (sel.rangeCount > 0 && document.body.contains(sel.anchorNode)) {{
+            window._savedRange = sel.getRangeAt(0).cloneRange();
+        }}
+        sendFormatState();
+    }});
 }});
+function mqRestoreSelection() {{
+    document.body.focus();
+    if (window._savedRange) {{
+        var sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(window._savedRange);
+    }}
+}}
 </script>
+</head>
+<body contenteditable="true" spellcheck="true"></body>
 </html>"#
             );
 
@@ -536,23 +592,57 @@ document.body.addEventListener('input', function() {{
                 .css_classes(["compose-toolbar"])
                 .build();
 
-            let wv_ref = &self.body_webview;
+            let wv_ref = &self.body_webview;  // Rc<RefCell<...>> — cloning gives shared ref
 
-            // Helper to create a simple formatting button
+            // Helper to create a simple formatting button.
+            // Buttons are non-focusable so they don't steal focus (and thus
+            // the text selection) from the WebView when clicked.
+            // Helper to create a formatting button that executes a command on
+            // the WebView without stealing focus.  We intercept the click in
+            // the CAPTURE phase — before the button receives it — so the
+            // WebView retains focus and the text selection stays intact.
+            // JS snippet that runs a formatting command and immediately
+            // reports the new state back so the toolbar buttons update.
+            let fmt_js = |cmd: &str| -> String {
+                format!(
+                    "document.execCommand('{}', false, null); \
+                     (function() {{ \
+                         var block = document.queryCommandValue('formatBlock'); \
+                         var s = 'fmt:' + [ \
+                             document.queryCommandState('bold') ? 'bold' : '', \
+                             document.queryCommandState('italic') ? 'italic' : '', \
+                             document.queryCommandState('underline') ? 'underline' : '', \
+                             document.queryCommandState('strikeThrough') ? 'strikeThrough' : '', \
+                             block \
+                         ].join(','); \
+                         window.webkit.messageHandlers.mqUpdate.postMessage(s); \
+                     }})();",
+                    cmd
+                )
+            };
+
+            let fmt_btn_list = &self.fmt_buttons;
+
             let make_fmt_btn = |icon: &str, tooltip: &str, command: &str| -> gtk::Button {
                 let btn = gtk::Button::builder()
                     .icon_name(icon)
                     .tooltip_text(tooltip)
+                    .focusable(false)
                     .css_classes(["flat", "circular"])
                     .build();
-                let cmd = command.to_string();
+                let js = fmt_js(command);
                 let wv = wv_ref.clone();
-                btn.connect_clicked(move |_| {
+                let gesture = gtk::GestureClick::new();
+                gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+                gesture.connect_pressed(move |g, _, _, _| {
                     if let Some(ref wv) = *wv.borrow() {
-                        let js = format!("document.execCommand('{}', false, null);", cmd);
                         wv.evaluate_javascript(&js, None, None, None::<&gtk::gio::Cancellable>, |_| {});
                     }
+                    g.set_state(gtk::EventSequenceState::Claimed);
                 });
+                btn.add_controller(gesture);
+                // Register for format state highlighting
+                fmt_btn_list.borrow_mut().push((command.to_string(), btn.clone()));
                 btn
             };
 
@@ -568,21 +658,32 @@ document.body.addEventListener('input', function() {{
             sep1.set_margin_end(4);
             toolbar.append(&sep1);
 
-            // Headings
+            // Headings — toggle: click again to revert to normal paragraph
             for (label, tag) in [("H1", "h1"), ("H2", "h2"), ("H3", "h3")] {
                 let btn = gtk::Button::builder()
                     .label(label)
                     .tooltip_text(&format!("Heading {}", &label[1..]))
+                    .focusable(false)
                     .css_classes(["flat", "circular"])
                     .build();
                 let wv = wv_ref.clone();
-                let tag = tag.to_string();
-                btn.connect_clicked(move |_| {
+                let tag_s = tag.to_string();
+                let gesture = gtk::GestureClick::new();
+                gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+                let state_js = fmt_js("noop").replace("document.execCommand('noop', false, null); ", "");
+                gesture.connect_pressed(move |g, _, _, _| {
                     if let Some(ref wv) = *wv.borrow() {
-                        let js = format!("document.execCommand('formatBlock', false, '{}');", tag);
+                        let js = format!(
+                            "var cur = document.queryCommandValue('formatBlock'); \
+                             document.execCommand('formatBlock', false, cur === '{}' ? 'p' : '{}'); {}",
+                            tag_s, tag_s, state_js
+                        );
                         wv.evaluate_javascript(&js, None, None, None::<&gtk::gio::Cancellable>, |_| {});
                     }
+                    g.set_state(gtk::EventSequenceState::Claimed);
                 });
+                btn.add_controller(gesture);
+                fmt_btn_list.borrow_mut().push((tag.to_string(), btn.clone()));
                 toolbar.append(&btn);
             }
 
@@ -590,15 +691,24 @@ document.body.addEventListener('input', function() {{
             let normal_btn = gtk::Button::builder()
                 .label("P")
                 .tooltip_text("Normal text")
+                .focusable(false)
                 .css_classes(["flat", "circular"])
                 .build();
-            let wv = wv_ref.clone();
-            normal_btn.connect_clicked(move |_| {
-                if let Some(ref wv) = *wv.borrow() {
-                    let js = "document.execCommand('formatBlock', false, 'p');";
-                    wv.evaluate_javascript(js, None, None, None::<&gtk::gio::Cancellable>, |_| {});
-                }
-            });
+            {
+                let wv = wv_ref.clone();
+                let gesture = gtk::GestureClick::new();
+                gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+                gesture.connect_pressed(move |g, _, _, _| {
+                    if let Some(ref wv) = *wv.borrow() {
+                        wv.evaluate_javascript(
+                            "document.execCommand('formatBlock', false, 'p');",
+                            None, None, None::<&gtk::gio::Cancellable>, |_| {},
+                        );
+                    }
+                    g.set_state(gtk::EventSequenceState::Claimed);
+                });
+                normal_btn.add_controller(gesture);
+            }
             toolbar.append(&normal_btn);
 
             let sep2 = gtk::Separator::new(gtk::Orientation::Vertical);
@@ -615,26 +725,40 @@ document.body.addEventListener('input', function() {{
             sep3.set_margin_end(4);
             toolbar.append(&sep3);
 
-            // Code block
-            toolbar.append(&make_fmt_btn("utilities-terminal-symbolic", "Code block", "formatBlock"));
-            // Override the code block button to use <pre>
-            if let Some(code_btn) = toolbar.last_child() {
-                if let Some(btn) = code_btn.downcast_ref::<gtk::Button>() {
-                    let wv = wv_ref.clone();
-                    btn.connect_clicked(move |_| {
-                        if let Some(ref wv) = *wv.borrow() {
-                            let js = "document.execCommand('formatBlock', false, 'pre');";
-                            wv.evaluate_javascript(js, None, None, None::<&gtk::gio::Cancellable>, |_| {});
-                        }
-                    });
-                }
+            // Code block — toggle: click again to revert to <p>
+            {
+                let btn = gtk::Button::builder()
+                    .icon_name("utilities-terminal-symbolic")
+                    .tooltip_text("Code block")
+                    .focusable(false)
+                    .css_classes(["flat", "circular"])
+                    .build();
+                let wv = wv_ref.clone();
+                let gesture = gtk::GestureClick::new();
+                gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+                let state_js = fmt_js("noop").replace("document.execCommand('noop', false, null); ", "");
+                gesture.connect_pressed(move |g, _, _, _| {
+                    if let Some(ref wv) = *wv.borrow() {
+                        let js = format!(
+                            "var cur = document.queryCommandValue('formatBlock'); \
+                             document.execCommand('formatBlock', false, cur === 'pre' ? 'p' : 'pre'); {}",
+                            state_js
+                        );
+                        wv.evaluate_javascript(&js, None, None, None::<&gtk::gio::Cancellable>, |_| {});
+                    }
+                    g.set_state(gtk::EventSequenceState::Claimed);
+                });
+                btn.add_controller(gesture);
+                fmt_btn_list.borrow_mut().push(("pre".to_string(), btn.clone()));
+                toolbar.append(&btn);
             }
 
             // Link
             {
                 let link_btn = gtk::Button::builder()
-                    .icon_name("chain-link-symbolic")
+                    .icon_name("insert-link-symbolic")
                     .tooltip_text("Insert link")
+                    .focusable(false)
                     .css_classes(["flat", "circular"])
                     .build();
                 let wv = wv_ref.clone();
@@ -680,6 +804,7 @@ document.body.addEventListener('input', function() {{
                 let color_btn = gtk::Button::builder()
                     .icon_name("color-select-symbolic")
                     .tooltip_text("Text color")
+                    .focusable(false)
                     .css_classes(["flat", "circular"])
                     .build();
                 let wv = wv_ref.clone();
@@ -718,6 +843,7 @@ document.body.addEventListener('input', function() {{
                 let highlight_btn = gtk::Button::builder()
                     .icon_name("document-edit-symbolic")
                     .tooltip_text("Highlight color")
+                    .focusable(false)
                     .css_classes(["flat", "circular"])
                     .build();
                 let wv = wv_ref.clone();
@@ -1090,7 +1216,7 @@ impl MqComposeWindow {
             let escaped = html.replace('\\', "\\\\").replace('\'', "\\'");
             // Wait for the WebView to finish loading before setting content
             let wv_clone = wv.clone();
-            let cached = self.imp().cached_body_html.clone();
+            let cached = std::rc::Rc::clone(&self.imp().cached_body_html);
             wv.connect_load_changed(move |_, event| {
                 if event == webkit6::LoadEvent::Finished {
                     let js = format!(
@@ -1102,7 +1228,7 @@ impl MqComposeWindow {
                          sel.removeAllRanges(); \
                          sel.addRange(range); \
                          document.body.focus(); \
-                         window.webkit.messageHandlers.bodyChanged.postMessage(document.body.innerHTML);",
+                         window.webkit.messageHandlers.mqUpdate.postMessage('html:' + document.body.innerHTML);",
                         escaped
                     );
                     wv_clone.evaluate_javascript(&js, None, None, None::<&gtk::gio::Cancellable>, |_| {});
@@ -1545,3 +1671,4 @@ fn html_to_plain_text(html: &str) -> String {
     }
     text.trim().to_string()
 }
+

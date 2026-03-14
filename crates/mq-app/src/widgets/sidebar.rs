@@ -3,7 +3,8 @@
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gio, glib};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 mod imp {
     use super::*;
@@ -18,7 +19,7 @@ mod imp {
         pub add_account_button: RefCell<Option<gtk::Button>>,
         pub selected_mailbox: RefCell<String>,
         /// None = All Accounts, Some(id) = specific account.
-        pub selected_account_id: RefCell<Option<i64>>,
+        pub selected_account_id: Rc<Cell<Option<i64>>>,
     }
 
     #[glib::object_subclass]
@@ -312,7 +313,7 @@ impl MqSidebar {
     /// The callback receives `None` for "All Accounts" or `Some(account_id)`.
     pub fn connect_account_selected<F: Fn(Option<i64>) + 'static>(&self, f: F) {
         let imp = self.imp();
-        let selected_id = imp.selected_account_id.clone();
+        let selected_id = Rc::clone(&imp.selected_account_id);
         if let Some(list_box) = imp.account_list.borrow().as_ref() {
             list_box.connect_row_selected(move |_, row| {
                 if let Some(row) = row {
@@ -322,7 +323,7 @@ impl MqSidebar {
                     } else {
                         name.parse::<i64>().ok()
                     };
-                    *selected_id.borrow_mut() = account_id;
+                    selected_id.set(account_id);
                     f(account_id);
                 }
             });
@@ -420,7 +421,7 @@ impl MqSidebar {
 
     /// Get the currently selected account ID (None = All Accounts).
     pub fn selected_account_id(&self) -> Option<i64> {
-        *self.imp().selected_account_id.borrow()
+        self.imp().selected_account_id.get()
     }
 
     /// Populate the labels list with user-defined labels.

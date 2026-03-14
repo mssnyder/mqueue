@@ -42,3 +42,15 @@
 .compose-toolbar separator {
     margin: 2px 0;
 }
+
+/* Active state for formatting toolbar buttons — must override .flat */
+.compose-toolbar button.flat.fmt-active,
+.compose-toolbar button.fmt-active {
+    background-color: alpha(currentColor, 0.2);
+    box-shadow: inset 0 0 0 1px alpha(currentColor, 0.1);
+}
+
+/* Prevent toast title from truncating */
+toast > widget > box > label {
+    min-width: 0;
+}

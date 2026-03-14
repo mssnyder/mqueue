@@ -30,6 +30,8 @@ mod imp {
         pub loading_more: std::rc::Rc<std::cell::Cell<bool>>,
         /// Callback fired when the user scrolls near the bottom.
         pub load_more_callback: std::rc::Rc<RefCell<Option<Box<dyn Fn()>>>>,
+        /// Signal handler ID for the compose button (to disconnect on re-wire).
+        pub compose_handler_id: RefCell<Option<glib::SignalHandlerId>>,
     }
 
     impl std::fmt::Debug for MqMessageList {
@@ -598,9 +600,17 @@ impl MqMessageList {
     }
 
     /// Connect a callback for the Compose button.
+    ///
+    /// Disconnects any previously connected handler to prevent duplicates
+    /// when `setup_ui` is called multiple times (e.g. after adding an account).
     pub fn connect_compose_clicked<F: Fn() + 'static>(&self, f: F) {
         if let Some(btn) = self.imp().compose_button.borrow().as_ref() {
-            btn.connect_clicked(move |_| f());
+            // Disconnect previous handler if any
+            if let Some(old_id) = self.imp().compose_handler_id.borrow_mut().take() {
+                btn.disconnect(old_id);
+            }
+            let id = btn.connect_clicked(move |_| f());
+            *self.imp().compose_handler_id.borrow_mut() = Some(id);
         }
     }
 

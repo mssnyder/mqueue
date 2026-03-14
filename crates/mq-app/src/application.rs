@@ -2746,9 +2746,6 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
 
             // Build execute callback for immediate execution when superseded
             let exec_pool = pool.clone();
-            let exec_sync_pool = pool.clone();
-            let exec_win = del_win.clone();
-            let exec_msgs = del_msgs.clone();
             let exec_execute = execute.clone();
             let exec_mailbox = mailbox.clone();
             let execute_now: Rc<dyn Fn()> = Rc::new(move || {
@@ -2757,9 +2754,6 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
                 }
                 exec_execute.set(false);
                 let pool = exec_pool.clone();
-                let sync_pool = exec_sync_pool.clone();
-                let sync_win = exec_win.clone();
-                let sync_msgs = exec_msgs.clone();
                 let mailbox = exec_mailbox.clone();
                 runtime::spawn_async(
                     async move {
@@ -2769,11 +2763,8 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
                         if let Err(e) = mq_db::queries::messages::delete_message(&pool, db_id).await {
                             warn!("Failed to delete message locally: {e}");
                         }
-                        account_id
                     },
-                    move |account_id: i64| {
-                        trigger_sync_account(account_id, &sync_pool, &sync_win, &sync_msgs);
-                    },
+                    move |_: ()| {},
                 );
             });
 
@@ -2866,9 +2857,6 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
 
             // Build execute callback for immediate execution when superseded
             let exec_pool = pool.clone();
-            let exec_sync_pool = pool.clone();
-            let exec_win = arch_win.clone();
-            let exec_msgs = arch_msgs.clone();
             let exec_execute = execute.clone();
             let exec_mailbox = mailbox.clone();
             let execute_now: Rc<dyn Fn()> = Rc::new(move || {
@@ -2877,9 +2865,6 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
                 }
                 exec_execute.set(false);
                 let pool = exec_pool.clone();
-                let sync_pool = exec_sync_pool.clone();
-                let sync_win = exec_win.clone();
-                let sync_msgs = exec_msgs.clone();
                 let mailbox = exec_mailbox.clone();
                 runtime::spawn_async(
                     async move {
@@ -2889,11 +2874,8 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
                         if let Err(e) = mq_db::queries::messages::delete_message(&pool, db_id).await {
                             warn!("Failed to delete archived message locally: {e}");
                         }
-                        account_id
                     },
-                    move |account_id: i64| {
-                        trigger_sync_account(account_id, &sync_pool, &sync_win, &sync_msgs);
-                    },
+                    move |_: ()| {},
                 );
             });
 
@@ -2983,7 +2965,8 @@ fn wire_compose_buttons(
         let accts = account_tuples.clone();
         let pool = pool.clone();
         window.message_list().connect_compose_clicked(move || {
-            open_compose(&w, &accts, ComposeMode::New, None, &pool);
+            let selected = w.sidebar().selected_account_id();
+            open_compose(&w, &accts, ComposeMode::New, selected, &pool);
         });
     }
 
