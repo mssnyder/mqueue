@@ -447,6 +447,17 @@ impl MqWindow {
         }
     }
 
+    /// Close the search bar (triggered by Escape).
+    pub fn activate_close_search(&self) {
+        if self.is_search_active() {
+            let list = self.message_list();
+            let btn = list.imp().search_button.borrow().clone();
+            if let Some(btn) = btn {
+                btn.set_active(false);
+            }
+        }
+    }
+
     /// Toggle the search bar (triggered by Ctrl+F).
     pub fn activate_search(&self) {
         let list = self.message_list();

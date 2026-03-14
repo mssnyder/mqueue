@@ -125,6 +125,14 @@ pub fn setup_actions(app: &adw::Application, window: &crate::widgets::window::Mq
     });
     window.add_action(&prev_msg_action);
 
+    // Close search (Escape)
+    let close_search_action = gio::SimpleAction::new("close-search", None);
+    let window_clone = window.clone();
+    close_search_action.connect_activate(move |_, _| {
+        window_clone.activate_close_search();
+    });
+    window.add_action(&close_search_action);
+
     // --- Set accelerators ---
     app.set_accels_for_action("app.quit", &["<Control>q"]);
     app.set_accels_for_action("app.preferences", &["<Control>comma"]);
@@ -140,6 +148,7 @@ pub fn setup_actions(app: &adw::Application, window: &crate::widgets::window::Mq
     app.set_accels_for_action("win.read-toggle", &["<Shift>u"]);
     app.set_accels_for_action("win.next-message", &["j"]);
     app.set_accels_for_action("win.prev-message", &["k"]);
+    app.set_accels_for_action("win.close-search", &["Escape"]);
 }
 
 /// Show the keyboard shortcuts window.
@@ -155,6 +164,7 @@ fn show_shortcuts_window(window: &crate::widgets::window::MqWindow) {
         .build();
     add_shortcut(&general_group, "<Control>n", "Compose new message");
     add_shortcut(&general_group, "<Control>f", "Search messages");
+    add_shortcut(&general_group, "Escape", "Close search / compose");
     add_shortcut(&general_group, "<Control>comma", "Preferences");
     add_shortcut(&general_group, "<Control>q", "Quit");
     add_shortcut(&general_group, "<Control>question", "Keyboard shortcuts");

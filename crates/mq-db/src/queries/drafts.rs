@@ -12,13 +12,14 @@ pub async fn upsert_draft(
     bcc_addrs: &str,
     subject: &str,
     body_text: &str,
+    body_html: &str,
     compose_mode: &str,
     compose_data: Option<&str>,
 ) -> anyhow::Result<i64> {
     if let Some(id) = draft_id {
         sqlx::query(
             "UPDATE drafts SET to_addrs = ?, cc_addrs = ?, bcc_addrs = ?, \
-             subject = ?, body_text = ?, compose_mode = ?, compose_data = ?, \
+             subject = ?, body_text = ?, body_html = ?, compose_mode = ?, compose_data = ?, \
              updated_at = datetime('now') WHERE id = ?",
         )
         .bind(to_addrs)
@@ -26,6 +27,7 @@ pub async fn upsert_draft(
         .bind(bcc_addrs)
         .bind(subject)
         .bind(body_text)
+        .bind(body_html)
         .bind(compose_mode)
         .bind(compose_data)
         .bind(id)
@@ -35,8 +37,8 @@ pub async fn upsert_draft(
     } else {
         let row = sqlx::query(
             "INSERT INTO drafts (account_id, to_addrs, cc_addrs, bcc_addrs, \
-             subject, body_text, compose_mode, compose_data) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+             subject, body_text, body_html, compose_mode, compose_data) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(account_id)
         .bind(to_addrs)
@@ -44,6 +46,7 @@ pub async fn upsert_draft(
         .bind(bcc_addrs)
         .bind(subject)
         .bind(body_text)
+        .bind(body_html)
         .bind(compose_mode)
         .bind(compose_data)
         .fetch_one(pool)

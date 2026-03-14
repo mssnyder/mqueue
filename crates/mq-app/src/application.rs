@@ -519,17 +519,23 @@ fn setup_ui(window: MqWindow, data: AppData) -> Rc<RefCell<Vec<MessageData>>> {
                                 }
                             }
 
-                            (None, Some(conversation), allowed, total_blocked, total_tracking, true, att_data)
+                            // Collect thread metadata for expand-to-read
+                            let thread_meta: Vec<(i64, u32, i64, String, bool)> = thread_msgs
+                                .iter()
+                                .map(|m| (m.id, m.uid as u32, m.account_id, m.mailbox.clone(), m.flags.contains("\\Seen")))
+                                .collect();
+
+                            (None, Some(conversation), allowed, total_blocked, total_tracking, true, att_data, Some(thread_meta))
                         } else {
                             // Single message — load just this one
                             let body = load_message_body(&pool, db_id).await;
                             let blocked = body.as_ref().map(|b| b.blocked_images).unwrap_or(0);
                             let tracking = body.as_ref().map(|b| b.tracking_pixels).unwrap_or(0);
                             let is_html = body.as_ref().map(|b| b.is_html).unwrap_or(false);
-                            (body, None, allowed, blocked, tracking, is_html, att_data)
+                            (body, None, allowed, blocked, tracking, is_html, att_data, None)
                         }
                     },
-                    move |(body, conversation, sender_allowed, blocked, tracking, _is_html, att_data): (
+                    move |(body, conversation, sender_allowed, blocked, tracking, _is_html, att_data, thread_meta): (
                         Option<BodyResult>,
                         Option<Vec<(String, String, String, String, bool)>>,
                         bool,
@@ -537,6 +543,7 @@ fn setup_ui(window: MqWindow, data: AppData) -> Rc<RefCell<Vec<MessageData>>> {
                         usize,
                         bool,
                         Vec<(i64, String, String, Option<u64>)>,
+                        Option<Vec<(i64, u32, i64, String, bool)>>,
                     )| {
                         // Discard stale result if user has already selected another message.
                         if gen_win.body_load_generation() != my_gen {
@@ -545,6 +552,9 @@ fn setup_ui(window: MqWindow, data: AppData) -> Rc<RefCell<Vec<MessageData>>> {
 
                         if let Some(conversation) = conversation {
                             // Thread view: show full conversation
+                            if let Some(meta) = thread_meta {
+                                v.set_thread_message_meta(meta);
+                            }
                             v.set_conversation(&conversation);
                         } else if let Some(body) = body {
                             // Single message view — prefer HTML rendering
@@ -847,6 +857,11 @@ fn setup_ui(window: MqWindow, data: AppData) -> Rc<RefCell<Vec<MessageData>>> {
         let e = account_emails.clone();
         let n = data.accounts.len();
         window.message_list().connect_load_more(move || {
+            // Don't load more messages if user is viewing search results
+            if w.is_search_active() {
+                w.message_list().load_more_finished();
+                return;
+            }
             let mailbox = w.sidebar().selected_mailbox();
             let account_id = w.sidebar().selected_account_id();
             let current_count = m.borrow().len() as i64;
@@ -1295,8 +1310,8 @@ fn start_background_sync(
             }
         }
 
-        let mut grand_total = 0usize;
         let mut idle_started = false;
+        let mut new_inbox_messages: Vec<NewMailInfo> = Vec::new();
 
         for mailbox in &mailboxes {
             // Simple display name: strip leading "[Gmail]/" prefix if present
@@ -1488,8 +1503,22 @@ fn start_background_sync(
                 }
             }
 
-            grand_total += total;
-
+            // Collect new INBOX messages for notifications
+            if mailbox == "INBOX" && total > 0 {
+                for email_msg in &outcome.new_messages {
+                    let sender = email_msg.from.as_ref()
+                        .map(|a| a.name.as_deref().unwrap_or(&a.email).to_string())
+                        .unwrap_or_else(|| "Unknown sender".to_string());
+                    let subject = email_msg.subject.as_deref().unwrap_or("(no subject)").to_string();
+                    let snippet = email_msg.snippet.as_deref().unwrap_or("").to_string();
+                    new_inbox_messages.push(NewMailInfo {
+                        db_id: 0,
+                        sender,
+                        subject,
+                        snippet,
+                    });
+                }
+            }
             // Save final sync state for this mailbox
             let _ = mq_db::queries::sync_state::upsert_sync_state(
                 &pool,
@@ -1541,14 +1570,14 @@ fn start_background_sync(
 
                                 let _ = idle_tx.send(SyncProgress::NewMail).await;
 
-                                let (synced_session, new_count) = run_idle_sync(
+                                let (synced_session, new_msgs) = run_idle_sync(
                                     session, &idle_pool, idle_account_id, &idle_tx,
                                 ).await;
 
                                 match synced_session {
                                     Some(s) => {
-                                        if new_count > 0 {
-                                            let _ = idle_tx.send(SyncProgress::Done(new_count)).await;
+                                        if !new_msgs.is_empty() {
+                                            let _ = idle_tx.send(SyncProgress::Done(new_msgs)).await;
                                         } else {
                                             let _ = idle_tx.send(SyncProgress::IdleResumed).await;
                                         }
@@ -1606,10 +1635,9 @@ fn start_background_sync(
             }
         }
 
-        let _ = tx.send(SyncProgress::Done(grand_total)).await;
+        let _ = tx.send(SyncProgress::Done(new_inbox_messages)).await;
 
         // --- IMAP IDLE: stay connected and watch for new mail ---
-        let _ = tx.send(SyncProgress::Status("Watching for new mail\u{2026}".into())).await;
 
         use mq_core::imap::idle::{idle_loop, IdleEvent};
         use tokio::sync::mpsc as tokio_mpsc;
@@ -1637,14 +1665,14 @@ fn start_background_sync(
                     let _ = tx.send(SyncProgress::NewMail).await;
 
                     // Run incremental sync on INBOX
-                    let (synced_session, new_count) = run_idle_sync(
+                    let (synced_session, new_msgs) = run_idle_sync(
                         session, &pool, account_id, &tx,
                     ).await;
 
                     match synced_session {
                         Some(s) => {
-                            if new_count > 0 {
-                                let _ = tx.send(SyncProgress::Done(new_count)).await;
+                            if !new_msgs.is_empty() {
+                                let _ = tx.send(SyncProgress::Done(new_msgs)).await;
                             } else {
                                 let _ = tx.send(SyncProgress::IdleResumed).await;
                             }
@@ -1739,21 +1767,18 @@ fn start_background_sync(
                     }
                     break;
                 }
-                SyncProgress::Done(total) => {
+                SyncProgress::Done(new_msgs) => {
+                    let total = new_msgs.len();
                     info!(total, "Sync complete");
                     w.hide_progress();
                     w.hide_banner();
                     // Reload the selected thread so new messages show up
                     refresh_and_reload_selected(&w, &p, &sm);
-                    // Send desktop notification for new mail (only when window is not focused)
-                    if total > 0 && !w.is_active() {
+                    // Send per-message desktop notifications for new inbox mail
+                    if !new_msgs.is_empty() && !w.is_active() {
                         if let Some(app) = w.application() {
                             if let Some(adw_app) = app.downcast_ref::<adw::Application>() {
-                                send_new_mail_notification(
-                                    adw_app,
-                                    "New mail",
-                                    &format!("{total} new message{}", if total == 1 { "" } else { "s" }),
-                                );
+                                send_per_message_notifications(adw_app, &new_msgs);
                             }
                         }
                     }
@@ -1772,11 +1797,22 @@ fn start_background_sync(
     });
 }
 
+/// Info about a new inbox message (for notifications).
+#[derive(Debug, Clone)]
+struct NewMailInfo {
+    #[allow(dead_code)]
+    db_id: i64,
+    sender: String,
+    subject: String,
+    snippet: String,
+}
+
 enum SyncProgress {
     Status(String),
     Count(usize, usize),
     Error(String),
-    Done(usize),
+    /// Sync complete. Carries new inbox messages for notification display.
+    Done(Vec<NewMailInfo>),
     /// IDLE detected new mail — show a brief indicator.
     NewMail,
     /// IDLE resumed watching — clear any banners.
@@ -1790,7 +1826,7 @@ async fn run_idle_sync(
     pool: &SqlitePool,
     account_id: i64,
     tx: &async_channel::Sender<SyncProgress>,
-) -> (Option<mq_core::imap::client::ImapSession>, usize) {
+) -> (Option<mq_core::imap::client::ImapSession>, Vec<NewMailInfo>) {
     use mq_core::imap::sync;
 
     let mailbox = "INBOX";
@@ -1818,7 +1854,7 @@ async fn run_idle_sync(
         Err(e) => {
             tracing::warn!(error = %e, "IDLE sync failed");
             let _ = tx.send(SyncProgress::Error(format!("Sync failed: {e}"))).await;
-            return (None, 0);
+            return (None, vec![]);
         }
     };
 
@@ -1910,7 +1946,17 @@ async fn run_idle_sync(
         outcome.new_state.highest_uid as i64,
     ).await;
 
-    (Some(session), total)
+    // Collect new inbox message info for notifications
+    let new_msgs: Vec<NewMailInfo> = outcome.new_messages.iter().map(|m| NewMailInfo {
+        db_id: 0,
+        sender: m.from.as_ref()
+            .map(|a| a.name.as_deref().unwrap_or(&a.email).to_string())
+            .unwrap_or_else(|| "Unknown sender".to_string()),
+        subject: m.subject.as_deref().unwrap_or("(no subject)").to_string(),
+        snippet: m.snippet.as_deref().unwrap_or("").to_string(),
+    }).collect();
+
+    (Some(session), new_msgs)
 }
 
 /// Quick refresh of the message list from DB (called during/after sync).
@@ -2637,9 +2683,13 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
     let view4 = window.message_view();
     let del_win = window.clone();
     let del_msgs = shared_messages.clone();
-    // Shared pending-undo state: stores the timer source ID so the undo
-    // button can cancel the delayed server operation.
-    let pending_undo: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    // Shared pending-undo state: stores the timer source ID and an execute
+    // callback so cancelling a previous undo runs its server operation immediately.
+    struct PendingUndo {
+        source_id: glib::SourceId,
+        execute_now: Rc<dyn Fn()>,
+    }
+    let pending_undo: Rc<RefCell<Option<PendingUndo>>> = Rc::new(RefCell::new(None));
     let pending_undo_del = pending_undo.clone();
     window.message_view().connect_delete_clicked(move || {
         if let Some(msg) = selected_message(&ml4) {
@@ -2650,9 +2700,10 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
             let pool = pool4.clone();
             debug!(db_id, "Delete clicked");
 
-            // Cancel any previous pending undo (execute it immediately)
+            // Execute any previous pending undo immediately before starting new one
             if let Some(prev) = pending_undo_del.borrow_mut().take() {
-                prev.remove();
+                prev.source_id.remove();
+                (prev.execute_now)();
             }
 
             let pos = ml4.selection().selected();
@@ -2684,37 +2735,52 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
             );
 
             // Set up the delayed server operation
-            let sync_pool = pool.clone();
-            let sync_win = del_win.clone();
-            let sync_msgs = del_msgs.clone();
             let execute = Rc::new(std::cell::Cell::new(true));
-            let execute_timer = execute.clone();
             let pending_ref = pending_undo_del.clone();
+
+            // Build execute callback for immediate execution when superseded
+            let exec_pool = pool.clone();
+            let exec_sync_pool = pool.clone();
+            let exec_win = del_win.clone();
+            let exec_msgs = del_msgs.clone();
+            let exec_execute = execute.clone();
+            let exec_mailbox = mailbox.clone();
+            let execute_now: Rc<dyn Fn()> = Rc::new(move || {
+                if !exec_execute.get() {
+                    return;
+                }
+                exec_execute.set(false);
+                let pool = exec_pool.clone();
+                let sync_pool = exec_sync_pool.clone();
+                let sync_win = exec_win.clone();
+                let sync_msgs = exec_msgs.clone();
+                let mailbox = exec_mailbox.clone();
+                runtime::spawn_async(
+                    async move {
+                        if let Err(e) = imap_trash_message(&pool, account_id, &mailbox, uid).await {
+                            warn!("Failed to trash message on server: {e}");
+                        }
+                        if let Err(e) = mq_db::queries::messages::delete_message(&pool, db_id).await {
+                            warn!("Failed to delete message locally: {e}");
+                        }
+                        account_id
+                    },
+                    move |account_id: i64| {
+                        trigger_sync_account(account_id, &sync_pool, &sync_win, &sync_msgs);
+                    },
+                );
+            });
+
+            let timer_execute_now = execute_now.clone();
             let source_id = glib::timeout_add_local_once(
                 std::time::Duration::from_secs(5),
                 move || {
                     // Clear the pending undo reference
                     pending_ref.borrow_mut().take();
-                    if !execute_timer.get() {
-                        return;
-                    }
-                    runtime::spawn_async(
-                        async move {
-                            if let Err(e) = imap_trash_message(&pool, account_id, &mailbox, uid).await {
-                                warn!("Failed to trash message on server: {e}");
-                            }
-                            if let Err(e) = mq_db::queries::messages::delete_message(&pool, db_id).await {
-                                warn!("Failed to delete message locally: {e}");
-                            }
-                            account_id
-                        },
-                        move |account_id: i64| {
-                            trigger_sync_account(account_id, &sync_pool, &sync_win, &sync_msgs);
-                        },
-                    );
+                    (timer_execute_now)();
                 },
             );
-            *pending_undo_del.borrow_mut() = Some(source_id);
+            *pending_undo_del.borrow_mut() = Some(PendingUndo { source_id, execute_now });
 
             // Show undo toast
             let toast = adw::Toast::builder()
@@ -2756,9 +2822,10 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
             let pool = pool5.clone();
             debug!(db_id, "Archive clicked");
 
-            // Cancel any previous pending undo
+            // Execute any previous pending undo immediately before starting new one
             if let Some(prev) = pending_undo_arch.borrow_mut().take() {
-                prev.remove();
+                prev.source_id.remove();
+                (prev.execute_now)();
             }
 
             let pos = ml5.selection().selected();
@@ -2788,36 +2855,51 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
                 msg.gmail_thread_id(), msg.thread_count(),
             );
 
-            let sync_pool = pool.clone();
-            let sync_win = arch_win.clone();
-            let sync_msgs = arch_msgs.clone();
             let execute = Rc::new(std::cell::Cell::new(true));
-            let execute_timer = execute.clone();
             let pending_ref = pending_undo_arch.clone();
+
+            // Build execute callback for immediate execution when superseded
+            let exec_pool = pool.clone();
+            let exec_sync_pool = pool.clone();
+            let exec_win = arch_win.clone();
+            let exec_msgs = arch_msgs.clone();
+            let exec_execute = execute.clone();
+            let exec_mailbox = mailbox.clone();
+            let execute_now: Rc<dyn Fn()> = Rc::new(move || {
+                if !exec_execute.get() {
+                    return;
+                }
+                exec_execute.set(false);
+                let pool = exec_pool.clone();
+                let sync_pool = exec_sync_pool.clone();
+                let sync_win = exec_win.clone();
+                let sync_msgs = exec_msgs.clone();
+                let mailbox = exec_mailbox.clone();
+                runtime::spawn_async(
+                    async move {
+                        if let Err(e) = imap_archive_message(&pool, account_id, &mailbox, uid).await {
+                            warn!("Failed to archive message on server: {e}");
+                        }
+                        if let Err(e) = mq_db::queries::messages::delete_message(&pool, db_id).await {
+                            warn!("Failed to delete archived message locally: {e}");
+                        }
+                        account_id
+                    },
+                    move |account_id: i64| {
+                        trigger_sync_account(account_id, &sync_pool, &sync_win, &sync_msgs);
+                    },
+                );
+            });
+
+            let timer_execute_now = execute_now.clone();
             let source_id = glib::timeout_add_local_once(
                 std::time::Duration::from_secs(5),
                 move || {
                     pending_ref.borrow_mut().take();
-                    if !execute_timer.get() {
-                        return;
-                    }
-                    runtime::spawn_async(
-                        async move {
-                            if let Err(e) = imap_archive_message(&pool, account_id, &mailbox, uid).await {
-                                warn!("Failed to archive message on server: {e}");
-                            }
-                            if let Err(e) = mq_db::queries::messages::delete_message(&pool, db_id).await {
-                                warn!("Failed to delete archived message locally: {e}");
-                            }
-                            account_id
-                        },
-                        move |account_id: i64| {
-                            trigger_sync_account(account_id, &sync_pool, &sync_win, &sync_msgs);
-                        },
-                    );
+                    (timer_execute_now)();
                 },
             );
-            *pending_undo_arch.borrow_mut() = Some(source_id);
+            *pending_undo_arch.borrow_mut() = Some(PendingUndo { source_id, execute_now });
 
             let toast = adw::Toast::builder()
                 .title("Message archived")
@@ -2839,6 +2921,37 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
                 undo_ml.selection().set_selected(pos);
             });
             arch_win.show_toast(&toast);
+        }
+    });
+
+    // --- Thread message expansion: mark as read ---
+    let pool_expand = pool.clone();
+    let view_expand = window.message_view();
+    window.message_view().connect_thread_message_expanded({
+        let view = view_expand.clone();
+        let pool = pool_expand.clone();
+        move |idx| {
+            if let Some((db_id, uid, account_id, mailbox, is_read)) = view.thread_message_meta_at(idx) {
+                if is_read {
+                    return; // Already read
+                }
+                // Mark read in our metadata
+                view.mark_thread_meta_read(idx);
+                // Update CSS immediately (no page reload)
+                view.mark_thread_card_read(idx);
+                // Update local DB
+                let pool = pool.clone();
+                let mailbox = mailbox.clone();
+                runtime::spawn_async(
+                    async move {
+                        toggle_flag(&pool, db_id, "\\Seen", true).await;
+                        if let Err(e) = imap_store_flag(&pool, account_id, &mailbox, uid, "\\Seen", true).await {
+                            tracing::warn!(db_id, "Failed to mark expanded thread msg as read: {e}");
+                        }
+                    },
+                    |_: ()| {},
+                );
+            }
         }
     });
 }
@@ -3067,7 +3180,7 @@ fn open_compose_impl(
         },
     );
 
-    compose.apply_mode(&mode, &signature);
+    compose.apply_mode(&mode, &signature, config.compose.reply_position);
 
     // Wire "Save Draft" callback for close dialog
     {
@@ -3083,13 +3196,14 @@ fn open_compose_impl(
             let bcc = compose_win.bcc_addresses().join(", ");
             let subject = compose_win.subject();
             let body = compose_win.body_text();
+            let body_html = compose_win.body_html();
             let draft_id = compose_win.draft_id();
             let pool = draft_pool.clone();
             runtime::spawn_async(
                 async move {
                     let _ = mq_db::queries::drafts::upsert_draft(
                         &pool, draft_id, account_id,
-                        &to, &cc, &bcc, &subject, &body,
+                        &to, &cc, &bcc, &subject, &body, &body_html,
                         "new", None,
                     ).await;
                 },
@@ -3129,18 +3243,24 @@ fn open_compose_impl(
             return;
         }
 
-        // Read attachment files
-        let attachments: Vec<(String, String, Vec<u8>)> = compose_ref
-            .attachments()
-            .iter()
-            .filter_map(|(filename, path)| {
-                let data = std::fs::read(path).ok()?;
-                let mime = mime_guess::from_path(path)
-                    .first_or_octet_stream()
-                    .to_string();
-                Some((filename.clone(), mime, data))
-            })
-            .collect();
+        // Read attachment files (validate they still exist)
+        let raw_attachments = compose_ref.attachments();
+        let mut attachments: Vec<(String, String, Vec<u8>)> = Vec::new();
+        for (filename, path) in &raw_attachments {
+            match std::fs::read(path) {
+                Ok(data) => {
+                    let mime = mime_guess::from_path(path)
+                        .first_or_octet_stream()
+                        .to_string();
+                    attachments.push((filename.clone(), mime, data));
+                }
+                Err(_) => {
+                    let toast = adw::Toast::new(&format!("Attachment not found: {filename}"));
+                    send_window.show_toast(&toast);
+                    return;
+                }
+            }
+        }
 
         let email = mq_core::smtp::OutgoingEmail {
             from_email: from_email.clone(),
@@ -3150,7 +3270,10 @@ fn open_compose_impl(
             bcc: compose_ref.bcc_addresses(),
             subject: compose_ref.subject(),
             body_text: compose_ref.body_text(),
-            body_html: None,
+            body_html: {
+                let html = compose_ref.body_html();
+                if html.is_empty() { None } else { Some(html) }
+            },
             in_reply_to: in_reply_to.clone(),
             references: references.clone(),
             attachments,
@@ -3237,12 +3360,18 @@ fn open_compose_impl(
                         toast_win.show_toast(&toast);
                     } else {
                         info!("Email sent successfully, closing compose window");
-                        // Refresh the message list + thread view to show the sent reply
+                        // Refresh the message list + thread view to show the sent reply.
+                        // Delay the sync slightly to give Gmail time to process the sent message.
                         if let (Some(win), Some(pool), Some(msgs)) =
                             (refresh_win.as_ref(), refresh_pool.as_ref(), refresh_msgs.as_ref())
                         {
                             refresh_and_reload_selected(win, pool, msgs);
-                            trigger_sync_account(send_account_id, pool, win, msgs);
+                            let sync_win = win.clone();
+                            let sync_pool = pool.clone();
+                            let sync_msgs = msgs.clone();
+                            glib::timeout_add_seconds_local_once(2, move || {
+                                trigger_sync_account(send_account_id, &sync_pool, &sync_win, &sync_msgs);
+                            });
                         }
                     }
                 }
@@ -3706,14 +3835,36 @@ fn wire_network_awareness(
     );
 }
 
-/// Send a desktop notification for new mail.
+/// Send individual desktop notifications for new inbox messages.
 ///
-/// Called when IDLE detects new messages after a sync. Will be wired
-/// into the full IDLE → sync → notify pipeline once token storage is complete.
-fn send_new_mail_notification(app: &adw::Application, title: &str, body: &str) {
-    let notification = gio::Notification::new(title);
-    notification.set_body(Some(body));
-    app.send_notification(Some("new-mail"), &notification);
+/// Each notification shows the sender and subject, with a unique ID
+/// so they can be individually dismissed.
+fn send_per_message_notifications(app: &adw::Application, messages: &[NewMailInfo]) {
+    // Limit to 5 notifications to avoid flooding
+    let max_notifications = 5;
+    for (i, msg) in messages.iter().take(max_notifications).enumerate() {
+        let notification = gio::Notification::new(&msg.sender);
+        let body = if msg.snippet.is_empty() {
+            msg.subject.clone()
+        } else {
+            format!("{}\n{}", msg.subject, msg.snippet)
+        };
+        notification.set_body(Some(&body));
+        // Default action: clicking notification activates the app
+        notification.set_default_action("app.activate");
+
+        // Unique notification ID per message
+        let notif_id = format!("new-mail-{i}");
+        app.send_notification(Some(&notif_id), &notification);
+    }
+
+    // If there are more than max, show a summary for the rest
+    if messages.len() > max_notifications {
+        let remaining = messages.len() - max_notifications;
+        let notification = gio::Notification::new("New mail");
+        notification.set_body(Some(&format!("…and {remaining} more new message{}", if remaining == 1 { "" } else { "s" })));
+        app.send_notification(Some("new-mail-overflow"), &notification);
+    }
 }
 
 /// Set context-aware placeholder text for an empty mailbox.

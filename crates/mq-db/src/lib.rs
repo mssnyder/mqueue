@@ -14,6 +14,8 @@ const MIGRATION_001: &str = include_str!("migrations/20260312000000_initial.sql"
 const MIGRATION_002: &str = include_str!("migrations/20260313000000_add_contacts.sql");
 /// Add drafts table.
 const MIGRATION_003: &str = include_str!("migrations/20260314000000_add_drafts.sql");
+/// Add body_html column to drafts.
+const MIGRATION_004: &str = include_str!("migrations/20260315000000_add_draft_html.sql");
 
 /// Initialize the SQLite database, running migrations if needed.
 pub async fn init_pool(db_path: &Path) -> anyhow::Result<SqlitePool> {
@@ -117,6 +119,27 @@ async fn run_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
             .execute(pool)
             .await?;
         info!("Migration 003_add_drafts applied successfully");
+    }
+
+    // Migration 004: add body_html to drafts
+    let row = sqlx::query("SELECT COUNT(*) as cnt FROM _mq_migrations WHERE name = '004_add_draft_html'")
+        .fetch_one(pool)
+        .await?;
+    let count: i64 = sqlx::Row::get(&row, "cnt");
+
+    if count == 0 {
+        info!("Applying migration 004_add_draft_html");
+        for statement in split_sql_statements(MIGRATION_004) {
+            let trimmed = statement.trim();
+            if !trimmed.is_empty() {
+                sqlx::query(trimmed).execute(pool).await?;
+            }
+        }
+
+        sqlx::query("INSERT INTO _mq_migrations (name) VALUES ('004_add_draft_html')")
+            .execute(pool)
+            .await?;
+        info!("Migration 004_add_draft_html applied successfully");
     }
 
     Ok(())

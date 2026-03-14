@@ -10,6 +10,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::glib;
 use std::cell::RefCell;
+use std::rc::Rc;
 use webkit6::prelude::*;
 
 /// Cached content for re-rendering on theme change.
@@ -24,7 +25,7 @@ enum LastContent {
 mod imp {
     use super::*;
 
-    #[derive(Debug, Default)]
+    #[derive(Default)]
     pub struct MqMessageView {
         pub from_label: RefCell<Option<gtk::Label>>,
         pub to_label: RefCell<Option<gtk::Label>>,
@@ -65,6 +66,17 @@ mod imp {
         /// Last loaded content for re-rendering on theme change.
         /// Single: (html, text), Thread: vec of (from, date, html, text)
         pub(super) last_content: RefCell<LastContent>,
+        /// Callback when a thread card is expanded (index of the message).
+        pub(super) thread_expand_callback: Rc<RefCell<Option<Box<dyn Fn(u32)>>>>,
+        /// Metadata for thread messages: (db_id, uid, account_id, mailbox, is_read).
+        /// Used by the expand callback to mark messages as read.
+        pub thread_message_meta: RefCell<Vec<(i64, u32, i64, String, bool)>>,
+    }
+
+    impl std::fmt::Debug for MqMessageView {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("MqMessageView").finish_non_exhaustive()
+        }
     }
 
     #[glib::object_subclass]
@@ -530,6 +542,8 @@ impl MqMessageView {
 
     /// Set the body as plain text (wrapped in minimal HTML for WebKitGTK).
     pub fn set_body_text(&self, text: &str) {
+        // Ensure JS is disabled for single message display
+        self.sandbox_webview();
         // Cache for theme change re-render
         *self.imp().last_content.borrow_mut() = LastContent::Single {
             html: String::new(),
@@ -572,6 +586,8 @@ impl MqMessageView {
 
     /// Set the body as sanitized HTML (rendered directly in WebKitGTK).
     pub fn set_body_html(&self, html: &str) {
+        // Ensure JS is disabled for single message display
+        self.sandbox_webview();
         // Cache for theme change re-render
         *self.imp().last_content.borrow_mut() = LastContent::Single {
             html: html.to_string(),
@@ -764,7 +780,41 @@ impl MqMessageView {
             }
         }
 
+        // Add JS for thread expansion detection (our own HTML, safe to enable JS)
+        full_html.push_str("<script>");
+        full_html.push_str(
+            "document.querySelectorAll('details.thread-card').forEach(function(el, idx) {\
+                el.addEventListener('toggle', function() {\
+                    if (el.open && el.classList.contains('unread')) {\
+                        window.webkit.messageHandlers.threadExpand.postMessage(idx.toString());\
+                    }\
+                });\
+            });"
+        );
+        full_html.push_str("</script>");
         full_html.push_str("</body></html>");
+
+        // Enable JS for thread view (our own HTML, not untrusted email)
+        if let Some(wv) = imp.web_view.borrow().as_ref() {
+            if let Some(settings) = webkit6::prelude::WebViewExt::settings(wv) {
+                settings.set_enable_javascript(true);
+                settings.set_enable_javascript_markup(true);
+            }
+
+            // Register the script message handler for thread expansion
+            let ucm = wv.user_content_manager().unwrap();
+            ucm.register_script_message_handler("threadExpand", None);
+            let callback = imp.thread_expand_callback.clone();
+            ucm.connect_script_message_received(Some("threadExpand"), move |_ucm, value| {
+                if let Some(ref cb) = *callback.borrow() {
+                    let idx_str: String = format!("{}", value);
+                    let idx_str = idx_str.trim_matches('"');
+                    if let Ok(idx) = idx_str.parse::<u32>() {
+                        cb(idx);
+                    }
+                }
+            });
+        }
 
         self.load_html_into_webview(&full_html);
 
@@ -990,6 +1040,47 @@ impl MqMessageView {
         }
     }
 
+    /// Connect a callback for when a thread card is expanded (mark as read).
+    pub fn connect_thread_message_expanded<F: Fn(u32) + 'static>(&self, f: F) {
+        self.imp().thread_expand_callback.replace(Some(Box::new(f)));
+    }
+
+    /// Store metadata for thread messages so expand callbacks can mark them read.
+    pub fn set_thread_message_meta(&self, meta: Vec<(i64, u32, i64, String, bool)>) {
+        *self.imp().thread_message_meta.borrow_mut() = meta;
+    }
+
+    /// Get thread message metadata at an index.
+    pub fn thread_message_meta_at(&self, idx: u32) -> Option<(i64, u32, i64, String, bool)> {
+        self.imp().thread_message_meta.borrow().get(idx as usize).cloned()
+    }
+
+    /// Mark a thread card as read in the stored metadata.
+    pub fn mark_thread_meta_read(&self, idx: u32) {
+        let mut meta = self.imp().thread_message_meta.borrow_mut();
+        if let Some(entry) = meta.get_mut(idx as usize) {
+            entry.4 = true;
+        }
+    }
+
+    /// Mark a thread card as read visually (remove unread CSS class) via JS.
+    /// Preserves scroll position and expand/collapse state.
+    pub fn mark_thread_card_read(&self, idx: u32) {
+        if let Some(wv) = self.imp().web_view.borrow().as_ref() {
+            let js = format!(
+                "var cards = document.querySelectorAll('details.thread-card');\
+                 if (cards[{idx}]) {{ cards[{idx}].classList.remove('unread'); }}"
+            );
+            wv.evaluate_javascript(
+                &js,
+                None,
+                None,
+                None::<&gtk::gio::Cancellable>,
+                |_| {},
+            );
+        }
+    }
+
     /// Get the sidebar toggle button (for binding to an OverlaySplitView).
     pub fn sidebar_button(&self) -> Option<gtk::ToggleButton> {
         self.imp().sidebar_button.borrow().clone()
@@ -1028,6 +1119,19 @@ impl MqMessageView {
     fn load_html_into_webview(&self, html: &str) {
         if let Some(wv) = self.imp().web_view.borrow().as_ref() {
             wv.load_html(html, None);
+        }
+    }
+
+    /// Disable JS on the webview (sandbox for untrusted email content).
+    fn sandbox_webview(&self) {
+        if let Some(wv) = self.imp().web_view.borrow().as_ref() {
+            if let Some(settings) = webkit6::prelude::WebViewExt::settings(wv) {
+                settings.set_enable_javascript(false);
+                settings.set_enable_javascript_markup(false);
+            }
+            // Unregister thread expand handler to avoid duplicate registrations
+            let ucm = wv.user_content_manager().unwrap();
+            ucm.unregister_script_message_handler("threadExpand", None);
         }
     }
 }

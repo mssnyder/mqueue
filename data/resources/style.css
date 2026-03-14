@@ -27,3 +27,18 @@
     letter-spacing: 0.05em;
     font-size: 0.75em;
 }
+
+/* Compose window formatting toolbar */
+.compose-toolbar {
+    padding: 2px 0;
+}
+
+.compose-toolbar button {
+    min-width: 28px;
+    min-height: 28px;
+    padding: 2px;
+}
+
+.compose-toolbar separator {
+    margin: 2px 0;
+}

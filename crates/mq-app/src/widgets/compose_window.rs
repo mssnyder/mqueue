@@ -5,9 +5,11 @@
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
+use gtk::gdk;
 use gtk::glib;
 use std::cell::RefCell;
 use std::rc::Rc;
+use webkit6::prelude::*;
 
 /// A contact for autocomplete: (display_name, email).
 #[derive(Debug, Clone)]
@@ -75,6 +77,10 @@ mod imp {
         pub draft_id: RefCell<Option<i64>>,
         /// Callback to save the compose content as a draft.
         pub save_draft_callback: RefCell<Option<Box<dyn Fn(&super::MqComposeWindow)>>>,
+        /// Cached body HTML from the rich text editor WebView.
+        pub cached_body_html: RefCell<String>,
+        /// The rich text editor WebView (replaces body_view when active).
+        pub body_webview: RefCell<Option<webkit6::WebView>>,
     }
 
     impl std::fmt::Debug for MqComposeWindow {
@@ -205,20 +211,116 @@ mod imp {
             // Separator
             main_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
-            // Body text view
-            let scrolled = gtk::ScrolledWindow::builder()
-                .vexpand(true)
-                .hscrollbar_policy(gtk::PolicyType::Never)
-                .build();
+            // Formatting toolbar
+            let toolbar = Self::create_formatting_toolbar(&self);
+            main_box.append(&toolbar);
+            main_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
+            // Body rich text editor (WebView with contenteditable)
+            let body_webview = webkit6::WebView::new();
+            if let Some(settings) = WebViewExt::settings(&body_webview) {
+                settings.set_enable_javascript(true);
+                settings.set_enable_javascript_markup(true);
+                settings.set_enable_developer_extras(false);
+                settings.set_default_font_size(16);
+                settings.set_default_monospace_font_size(14);
+            }
+
+            // Transparent background
+            let transparent = gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0);
+            body_webview.set_background_color(&transparent);
+            body_webview.set_vexpand(true);
+            body_webview.set_hexpand(true);
+
+            // Register script message handler for body content caching
+            let ucm = body_webview.user_content_manager().unwrap();
+            ucm.register_script_message_handler("bodyChanged", None);
+            let cached_html = self.cached_body_html.clone();
+            ucm.connect_script_message_received(Some("bodyChanged"), move |_ucm, value| {
+                let html: String = format!("{}", value);
+                // Remove wrapping quotes from JS string
+                let html = html.trim_matches('"').to_string();
+                *cached_html.borrow_mut() = html;
+            });
+
+            // Detect dark mode for editor styling
+            let is_dark = adw::StyleManager::default().is_dark();
+            let (text_color, placeholder_color, code_bg) = if is_dark {
+                ("#e0e0e0", "#888", "rgba(255,255,255,0.08)")
+            } else {
+                ("#1a1a1a", "#999", "rgba(0,0,0,0.05)")
+            };
+
+            let editor_html = format!(
+                r#"<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+body {{
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 16px;
+    margin: 0;
+    padding: 12px;
+    min-height: 100%;
+    outline: none;
+    color: {text_color};
+    background: transparent;
+    line-height: 1.5;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}}
+body:empty:before {{
+    content: 'Compose your message...';
+    color: {placeholder_color};
+    pointer-events: none;
+}}
+pre, code {{
+    background: {code_bg};
+    border-radius: 3px;
+    padding: 2px 4px;
+    font-family: monospace;
+}}
+pre {{
+    padding: 8px 12px;
+}}
+blockquote {{
+    border-left: 3px solid #ccc;
+    margin-left: 0;
+    padding-left: 12px;
+    color: #666;
+}}
+h1 {{ font-size: 1.5em; margin: 0.4em 0; }}
+h2 {{ font-size: 1.3em; margin: 0.4em 0; }}
+h3 {{ font-size: 1.1em; margin: 0.4em 0; }}
+a {{ color: #1a73e8; }}
+ul, ol {{ padding-left: 24px; }}
+</style></head>
+<body contenteditable="true" spellcheck="true"></body>
+<script>
+document.body.addEventListener('input', function() {{
+    window.webkit.messageHandlers.bodyChanged.postMessage(document.body.innerHTML);
+}});
+</script>
+</html>"#
+            );
+
+            body_webview.load_html(&editor_html, None);
+
+            // Keep a plain text fallback view hidden (for backward compat)
             let body_view = gtk::TextView::builder()
                 .wrap_mode(gtk::WrapMode::WordChar)
                 .top_margin(12)
                 .bottom_margin(12)
                 .left_margin(12)
                 .right_margin(12)
+                .visible(false)
+                .build();
+
+            let scrolled = gtk::ScrolledWindow::builder()
+                .vexpand(true)
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .visible(false)
                 .build();
             scrolled.set_child(Some(&body_view));
+
+            main_box.append(&body_webview);
             main_box.append(&scrolled);
 
             window.set_content(Some(&main_box));
@@ -231,6 +333,26 @@ mod imp {
                 cc_row_clone.set_visible(show);
                 bcc_row_clone.set_visible(show);
             });
+
+            // Escape closes the compose window (triggers draft save dialog if content)
+            // Ctrl+Return sends the message
+            let key_controller = gtk::EventControllerKey::new();
+            let key_win = window.clone();
+            let key_send = send_button.clone();
+            key_controller.connect_key_pressed(move |_, key, _, modifiers| {
+                if key == gdk::Key::Escape {
+                    key_win.close();
+                    glib::Propagation::Stop
+                } else if key == gdk::Key::Return
+                    && modifiers.contains(gdk::ModifierType::CONTROL_MASK)
+                {
+                    key_send.emit_clicked();
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            });
+            window.add_controller(key_controller);
 
             // Wire attach button
             {
@@ -335,6 +457,7 @@ mod imp {
             *self.bcc_entry.borrow_mut() = Some(bcc_entry);
             *self.subject_entry.borrow_mut() = Some(subject_entry);
             *self.body_view.borrow_mut() = Some(body_view);
+            *self.body_webview.borrow_mut() = Some(body_webview);
             *self.send_button.borrow_mut() = Some(send_button);
             *self.cc_row.borrow_mut() = Some(cc_row);
             *self.bcc_row.borrow_mut() = Some(bcc_row);
@@ -401,6 +524,301 @@ mod imp {
     impl AdwWindowImpl for MqComposeWindow {}
 
     impl MqComposeWindow {
+        /// Create the rich text formatting toolbar.
+        fn create_formatting_toolbar(&self) -> gtk::Box {
+            let toolbar = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(2)
+                .margin_start(8)
+                .margin_end(8)
+                .margin_top(4)
+                .margin_bottom(4)
+                .css_classes(["compose-toolbar"])
+                .build();
+
+            let wv_ref = &self.body_webview;
+
+            // Helper to create a simple formatting button
+            let make_fmt_btn = |icon: &str, tooltip: &str, command: &str| -> gtk::Button {
+                let btn = gtk::Button::builder()
+                    .icon_name(icon)
+                    .tooltip_text(tooltip)
+                    .css_classes(["flat", "circular"])
+                    .build();
+                let cmd = command.to_string();
+                let wv = wv_ref.clone();
+                btn.connect_clicked(move |_| {
+                    if let Some(ref wv) = *wv.borrow() {
+                        let js = format!("document.execCommand('{}', false, null);", cmd);
+                        wv.evaluate_javascript(&js, None, None, None::<&gtk::gio::Cancellable>, |_| {});
+                    }
+                });
+                btn
+            };
+
+            // Text formatting
+            toolbar.append(&make_fmt_btn("format-text-bold-symbolic", "Bold (Ctrl+B)", "bold"));
+            toolbar.append(&make_fmt_btn("format-text-italic-symbolic", "Italic (Ctrl+I)", "italic"));
+            toolbar.append(&make_fmt_btn("format-text-underline-symbolic", "Underline (Ctrl+U)", "underline"));
+            toolbar.append(&make_fmt_btn("format-text-strikethrough-symbolic", "Strikethrough", "strikeThrough"));
+
+            // Separator
+            let sep1 = gtk::Separator::new(gtk::Orientation::Vertical);
+            sep1.set_margin_start(4);
+            sep1.set_margin_end(4);
+            toolbar.append(&sep1);
+
+            // Headings
+            for (label, tag) in [("H1", "h1"), ("H2", "h2"), ("H3", "h3")] {
+                let btn = gtk::Button::builder()
+                    .label(label)
+                    .tooltip_text(&format!("Heading {}", &label[1..]))
+                    .css_classes(["flat", "circular"])
+                    .build();
+                let wv = wv_ref.clone();
+                let tag = tag.to_string();
+                btn.connect_clicked(move |_| {
+                    if let Some(ref wv) = *wv.borrow() {
+                        let js = format!("document.execCommand('formatBlock', false, '{}');", tag);
+                        wv.evaluate_javascript(&js, None, None, None::<&gtk::gio::Cancellable>, |_| {});
+                    }
+                });
+                toolbar.append(&btn);
+            }
+
+            // Normal text button
+            let normal_btn = gtk::Button::builder()
+                .label("P")
+                .tooltip_text("Normal text")
+                .css_classes(["flat", "circular"])
+                .build();
+            let wv = wv_ref.clone();
+            normal_btn.connect_clicked(move |_| {
+                if let Some(ref wv) = *wv.borrow() {
+                    let js = "document.execCommand('formatBlock', false, 'p');";
+                    wv.evaluate_javascript(js, None, None, None::<&gtk::gio::Cancellable>, |_| {});
+                }
+            });
+            toolbar.append(&normal_btn);
+
+            let sep2 = gtk::Separator::new(gtk::Orientation::Vertical);
+            sep2.set_margin_start(4);
+            sep2.set_margin_end(4);
+            toolbar.append(&sep2);
+
+            // Lists
+            toolbar.append(&make_fmt_btn("view-list-symbolic", "Bullet list", "insertUnorderedList"));
+            toolbar.append(&make_fmt_btn("view-list-ordered-symbolic", "Numbered list", "insertOrderedList"));
+
+            let sep3 = gtk::Separator::new(gtk::Orientation::Vertical);
+            sep3.set_margin_start(4);
+            sep3.set_margin_end(4);
+            toolbar.append(&sep3);
+
+            // Code block
+            toolbar.append(&make_fmt_btn("utilities-terminal-symbolic", "Code block", "formatBlock"));
+            // Override the code block button to use <pre>
+            if let Some(code_btn) = toolbar.last_child() {
+                if let Some(btn) = code_btn.downcast_ref::<gtk::Button>() {
+                    let wv = wv_ref.clone();
+                    btn.connect_clicked(move |_| {
+                        if let Some(ref wv) = *wv.borrow() {
+                            let js = "document.execCommand('formatBlock', false, 'pre');";
+                            wv.evaluate_javascript(js, None, None, None::<&gtk::gio::Cancellable>, |_| {});
+                        }
+                    });
+                }
+            }
+
+            // Link
+            {
+                let link_btn = gtk::Button::builder()
+                    .icon_name("chain-link-symbolic")
+                    .tooltip_text("Insert link")
+                    .css_classes(["flat", "circular"])
+                    .build();
+                let wv = wv_ref.clone();
+                let window = self.obj().clone();
+                link_btn.connect_clicked(move |_| {
+                    let wv = wv.clone();
+                    let dialog = adw::AlertDialog::builder()
+                        .heading("Insert Link")
+                        .body("Enter URL:")
+                        .build();
+                    let entry = gtk::Entry::builder()
+                        .placeholder_text("https://example.com")
+                        .build();
+                    dialog.set_extra_child(Some(&entry));
+                    dialog.add_responses(&[("cancel", "Cancel"), ("insert", "Insert")]);
+                    dialog.set_response_appearance("insert", adw::ResponseAppearance::Suggested);
+                    dialog.set_default_response(Some("insert"));
+                    let entry_ref = entry.clone();
+                    dialog.connect_response(None, move |_, response| {
+                        if response == "insert" {
+                            let url = entry_ref.text().to_string();
+                            if !url.is_empty() {
+                                if let Some(ref wv) = *wv.borrow() {
+                                    let url_escaped = url.replace('\'', "\\'");
+                                    let js = format!("document.execCommand('createLink', false, '{}');", url_escaped);
+                                    wv.evaluate_javascript(&js, None, None, None::<&gtk::gio::Cancellable>, |_| {});
+                                }
+                            }
+                        }
+                    });
+                    dialog.present(Some(&window.clone().upcast::<gtk::Window>()));
+                });
+                toolbar.append(&link_btn);
+            }
+
+            let sep4 = gtk::Separator::new(gtk::Orientation::Vertical);
+            sep4.set_margin_start(4);
+            sep4.set_margin_end(4);
+            toolbar.append(&sep4);
+
+            // Text color
+            {
+                let color_btn = gtk::Button::builder()
+                    .icon_name("color-select-symbolic")
+                    .tooltip_text("Text color")
+                    .css_classes(["flat", "circular"])
+                    .build();
+                let wv = wv_ref.clone();
+                let window = self.obj().clone();
+                color_btn.connect_clicked(move |_| {
+                    let wv = wv.clone();
+                    let dialog = gtk::ColorDialog::builder()
+                        .title("Text Color")
+                        .build();
+                    let win = window.clone();
+                    dialog.choose_rgba(
+                        Some(&win.clone().upcast::<gtk::Window>()),
+                        None,
+                        None::<&gtk::gio::Cancellable>,
+                        move |result| {
+                            if let Ok(color) = result {
+                                let hex = format!(
+                                    "#{:02x}{:02x}{:02x}",
+                                    (color.red() * 255.0) as u8,
+                                    (color.green() * 255.0) as u8,
+                                    (color.blue() * 255.0) as u8,
+                                );
+                                if let Some(ref wv) = *wv.borrow() {
+                                    let js = format!("document.execCommand('foreColor', false, '{}');", hex);
+                                    wv.evaluate_javascript(&js, None, None, None::<&gtk::gio::Cancellable>, |_| {});
+                                }
+                            }
+                        },
+                    );
+                });
+                toolbar.append(&color_btn);
+            }
+
+            // Highlight color
+            {
+                let highlight_btn = gtk::Button::builder()
+                    .icon_name("document-edit-symbolic")
+                    .tooltip_text("Highlight color")
+                    .css_classes(["flat", "circular"])
+                    .build();
+                let wv = wv_ref.clone();
+                let window = self.obj().clone();
+                highlight_btn.connect_clicked(move |_| {
+                    let wv = wv.clone();
+                    let dialog = gtk::ColorDialog::builder()
+                        .title("Highlight Color")
+                        .build();
+                    let win = window.clone();
+                    dialog.choose_rgba(
+                        Some(&win.clone().upcast::<gtk::Window>()),
+                        None,
+                        None::<&gtk::gio::Cancellable>,
+                        move |result| {
+                            if let Ok(color) = result {
+                                let hex = format!(
+                                    "#{:02x}{:02x}{:02x}",
+                                    (color.red() * 255.0) as u8,
+                                    (color.green() * 255.0) as u8,
+                                    (color.blue() * 255.0) as u8,
+                                );
+                                if let Some(ref wv) = *wv.borrow() {
+                                    let js = format!("document.execCommand('hiliteColor', false, '{}');", hex);
+                                    wv.evaluate_javascript(&js, None, None, None::<&gtk::gio::Cancellable>, |_| {});
+                                }
+                            }
+                        },
+                    );
+                });
+                toolbar.append(&highlight_btn);
+            }
+
+            // Font size dropdown
+            {
+                let size_btn = gtk::MenuButton::builder()
+                    .icon_name("font-x-generic-symbolic")
+                    .tooltip_text("Font size")
+                    .css_classes(["flat", "circular"])
+                    .build();
+                let popover = gtk::Popover::new();
+                let size_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                for (label, size) in [("Small", "2"), ("Normal", "3"), ("Large", "5"), ("Huge", "7")] {
+                    let btn = gtk::Button::builder()
+                        .label(label)
+                        .css_classes(["flat"])
+                        .build();
+                    let wv = wv_ref.clone();
+                    let pop = popover.clone();
+                    let sz = size.to_string();
+                    btn.connect_clicked(move |_| {
+                        if let Some(ref wv) = *wv.borrow() {
+                            let js = format!("document.execCommand('fontSize', false, '{}');", sz);
+                            wv.evaluate_javascript(&js, None, None, None::<&gtk::gio::Cancellable>, |_| {});
+                        }
+                        pop.popdown();
+                    });
+                    size_box.append(&btn);
+                }
+                popover.set_child(Some(&size_box));
+                size_btn.set_popover(Some(&popover));
+                toolbar.append(&size_btn);
+            }
+
+            let sep5 = gtk::Separator::new(gtk::Orientation::Vertical);
+            sep5.set_margin_start(4);
+            sep5.set_margin_end(4);
+            toolbar.append(&sep5);
+
+            // Emoji picker
+            {
+                let emoji_btn = gtk::MenuButton::builder()
+                    .icon_name("face-smile-symbolic")
+                    .tooltip_text("Insert emoji")
+                    .css_classes(["flat", "circular"])
+                    .build();
+                let emoji_chooser = gtk::EmojiChooser::new();
+                let wv = wv_ref.clone();
+                emoji_chooser.connect_emoji_picked(move |_, emoji| {
+                    if let Some(ref wv) = *wv.borrow() {
+                        let emoji_escaped = emoji.replace('\'', "\\'");
+                        let js = format!("document.execCommand('insertText', false, '{}');", emoji_escaped);
+                        wv.evaluate_javascript(&js, None, None, None::<&gtk::gio::Cancellable>, |_| {});
+                    }
+                });
+                emoji_btn.set_popover(Some(&emoji_chooser));
+                toolbar.append(&emoji_btn);
+            }
+
+            // Wrap in a ScrolledWindow so toolbar items don't get truncated on narrow windows
+            let toolbar_scroll = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Automatic)
+                .vscrollbar_policy(gtk::PolicyType::Never)
+                .build();
+            toolbar_scroll.set_child(Some(&toolbar));
+
+            let wrapper = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            wrapper.append(&toolbar_scroll);
+            wrapper
+        }
+
         fn make_field_row(label_text: &str) -> gtk::Box {
             let row = gtk::Box::builder()
                 .orientation(gtk::Orientation::Horizontal)
@@ -555,10 +973,17 @@ impl MqComposeWindow {
         let has_to = !self.to_addresses().is_empty();
         let has_subject = !self.subject().is_empty();
         let has_body = {
-            let text = self.body_text();
-            // Ignore signature-only content (starts with "\n\n-- \n")
-            let trimmed = text.trim();
-            !trimmed.is_empty() && !trimmed.starts_with("-- \n")
+            // Check cached HTML first (rich editor)
+            let html = self.imp().cached_body_html.borrow().clone();
+            if !html.is_empty() {
+                let plain = html_to_plain_text(&html);
+                let trimmed = plain.trim();
+                !trimmed.is_empty() && !trimmed.starts_with("-- \n") && trimmed != "--"
+            } else {
+                let text = self.body_text();
+                let trimmed = text.trim();
+                !trimmed.is_empty() && !trimmed.starts_with("-- \n")
+            }
         };
         let has_attachments = !self.attachments().is_empty();
         has_to || has_subject || has_body || has_attachments
@@ -654,10 +1079,41 @@ impl MqComposeWindow {
 
     /// Set the body text and place cursor at the beginning.
     pub fn set_body(&self, text: &str) {
+        // Set body in the rich text editor WebView
+        if let Some(wv) = self.imp().body_webview.borrow().as_ref() {
+            // Convert plain text to HTML (preserve newlines as <br>)
+            let html = text
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('\n', "<br>");
+            let escaped = html.replace('\\', "\\\\").replace('\'', "\\'");
+            // Wait for the WebView to finish loading before setting content
+            let wv_clone = wv.clone();
+            let cached = self.imp().cached_body_html.clone();
+            wv.connect_load_changed(move |_, event| {
+                if event == webkit6::LoadEvent::Finished {
+                    let js = format!(
+                        "document.body.innerHTML = '{}'; \
+                         var range = document.createRange(); \
+                         range.setStart(document.body, 0); \
+                         range.collapse(true); \
+                         var sel = window.getSelection(); \
+                         sel.removeAllRanges(); \
+                         sel.addRange(range); \
+                         document.body.focus(); \
+                         window.webkit.messageHandlers.bodyChanged.postMessage(document.body.innerHTML);",
+                        escaped
+                    );
+                    wv_clone.evaluate_javascript(&js, None, None, None::<&gtk::gio::Cancellable>, |_| {});
+                    *cached.borrow_mut() = html.clone();
+                }
+            });
+        }
+        // Also set in the fallback TextView
         if let Some(tv) = self.imp().body_view.borrow().as_ref() {
             let buf = tv.buffer();
             buf.set_text(text);
-            // Place cursor at the very start so the user can type immediately
             let start = buf.start_iter();
             buf.place_cursor(&start);
         }
@@ -705,6 +1161,11 @@ impl MqComposeWindow {
 
     /// Get the body text.
     pub fn body_text(&self) -> String {
+        // If we have cached HTML from the rich editor, derive plain text from it
+        let cached = self.imp().cached_body_html.borrow().clone();
+        if !cached.is_empty() {
+            return html_to_plain_text(&cached);
+        }
         self.imp()
             .body_view
             .borrow()
@@ -715,6 +1176,11 @@ impl MqComposeWindow {
                     .to_string()
             })
             .unwrap_or_default()
+    }
+
+    /// Get the body as HTML (from the rich text editor).
+    pub fn body_html(&self) -> String {
+        self.imp().cached_body_html.borrow().clone()
     }
 
     /// Validate all address fields. Returns a list of error messages.
@@ -773,6 +1239,9 @@ impl MqComposeWindow {
         if let Some(scrolled) = imp.body_scrolled.borrow().as_ref() {
             scrolled.set_sensitive(!sending);
         }
+        if let Some(wv) = imp.body_webview.borrow().as_ref() {
+            wv.set_sensitive(!sending);
+        }
     }
 
     /// Connect a callback for the Send button.
@@ -783,12 +1252,23 @@ impl MqComposeWindow {
     }
 
     /// Apply a compose mode: pre-fill fields for reply, reply-all, or forward.
-    pub fn apply_mode(&self, mode: &ComposeMode, signature: &str) {
+    pub fn apply_mode(
+        &self,
+        mode: &ComposeMode,
+        signature: &str,
+        reply_position: mq_core::config::ReplyPosition,
+    ) {
+        let sig_block = if signature.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n-- \n{signature}")
+        };
+
         match mode {
             ComposeMode::New => {
                 self.set_title(Some("New Message"));
-                if !signature.is_empty() {
-                    self.set_body(&format!("\n\n-- \n{signature}"));
+                if !sig_block.is_empty() {
+                    self.set_body(&sig_block);
                 }
             }
             ComposeMode::Reply {
@@ -802,11 +1282,7 @@ impl MqComposeWindow {
                 self.set_to(from);
                 self.set_subject(&reply_subject(subject));
                 let quoted = quote_body(from, date, body);
-                if signature.is_empty() {
-                    self.set_body(&format!("\n\n{quoted}"));
-                } else {
-                    self.set_body(&format!("\n\n-- \n{signature}\n\n{quoted}"));
-                }
+                self.set_body(&format_reply_body(&sig_block, &quoted, reply_position));
             }
             ComposeMode::ReplyAll {
                 from,
@@ -824,8 +1300,6 @@ impl MqComposeWindow {
                     .map(|(_, e)| e.to_lowercase())
                     .unwrap_or_default();
                 // Merge original To + Cc into Cc (excluding the sender and self).
-                // Addresses may be in "Name <email>" format, so extract just the
-                // email part for comparison.
                 let extract_email = |addr: &str| -> String {
                     let addr = addr.trim();
                     if let Some(start) = addr.find('<') {
@@ -852,11 +1326,7 @@ impl MqComposeWindow {
                 }
                 self.set_subject(&reply_subject(subject));
                 let quoted = quote_body(from, date, body);
-                if signature.is_empty() {
-                    self.set_body(&format!("\n\n{quoted}"));
-                } else {
-                    self.set_body(&format!("\n\n-- \n{signature}\n\n{quoted}"));
-                }
+                self.set_body(&format_reply_body(&sig_block, &quoted, reply_position));
             }
             ComposeMode::Forward {
                 from,
@@ -876,11 +1346,7 @@ impl MqComposeWindow {
                      \n\
                      {body}"
                 );
-                if signature.is_empty() {
-                    self.set_body(&format!("\n\n{fwd}"));
-                } else {
-                    self.set_body(&format!("\n\n-- \n{signature}\n\n{fwd}"));
-                }
+                self.set_body(&format_reply_body(&sig_block, &fwd, reply_position));
             }
         }
     }
@@ -913,10 +1379,40 @@ impl MqComposeWindow {
 }
 
 fn parse_addresses(text: &str) -> Vec<String> {
-    text.split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
+    let mut results = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut in_angle = false;
+
+    for ch in text.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(ch);
+            }
+            '<' if !in_quotes => {
+                in_angle = true;
+                current.push(ch);
+            }
+            '>' if !in_quotes => {
+                in_angle = false;
+                current.push(ch);
+            }
+            ',' if !in_quotes && !in_angle => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    results.push(trimmed);
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        results.push(trimmed);
+    }
+    results
 }
 
 fn reply_subject(subject: &str) -> String {
@@ -957,6 +1453,32 @@ fn is_valid_email(addr: &str) -> bool {
     !local.is_empty() && !domain.is_empty() && domain.contains('.')
 }
 
+/// Format the compose body with signature and quoted text respecting reply position.
+fn format_reply_body(
+    sig_block: &str,
+    quoted: &str,
+    position: mq_core::config::ReplyPosition,
+) -> String {
+    match position {
+        mq_core::config::ReplyPosition::Above => {
+            // Cursor position above quoted text, signature between cursor and quote
+            if sig_block.is_empty() {
+                format!("\n\n{quoted}")
+            } else {
+                format!("{sig_block}\n\n{quoted}")
+            }
+        }
+        mq_core::config::ReplyPosition::Below => {
+            // Quoted text first, then signature at the end
+            if sig_block.is_empty() {
+                format!("\n\n{quoted}")
+            } else {
+                format!("\n\n{quoted}{sig_block}")
+            }
+        }
+    }
+}
+
 fn quote_body(from: &str, date: &str, body: &str) -> String {
     let quoted_lines: String = body
         .lines()
@@ -964,4 +1486,62 @@ fn quote_body(from: &str, date: &str, body: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("On {date}, {from} wrote:\n{quoted_lines}")
+}
+
+/// Simple HTML to plain text conversion for compose body.
+fn html_to_plain_text(html: &str) -> String {
+    let mut text = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut last_was_block = false;
+
+    let mut chars = html.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                // Check for block-level tags that need newlines
+                let tag_start: String = chars.clone().take(10).collect::<String>().to_lowercase();
+                if tag_start.starts_with("br")
+                    || tag_start.starts_with("/p")
+                    || tag_start.starts_with("/div")
+                    || tag_start.starts_with("/h")
+                    || tag_start.starts_with("/li")
+                    || tag_start.starts_with("/tr")
+                {
+                    if !last_was_block {
+                        text.push('\n');
+                        last_was_block = true;
+                    }
+                } else if tag_start.starts_with("li") {
+                    if !last_was_block {
+                        text.push('\n');
+                    }
+                    text.push_str("- ");
+                    last_was_block = false;
+                }
+            }
+            '>' if in_tag => {
+                in_tag = false;
+            }
+            '&' if !in_tag => {
+                let entity: String = chars.clone().take(10).take_while(|c| *c != ';').collect();
+                match entity.as_str() {
+                    "amp" => { text.push('&'); for _ in 0..4 { chars.next(); } }
+                    "lt" => { text.push('<'); for _ in 0..3 { chars.next(); } }
+                    "gt" => { text.push('>'); for _ in 0..3 { chars.next(); } }
+                    "quot" => { text.push('"'); for _ in 0..5 { chars.next(); } }
+                    "nbsp" => { text.push(' '); for _ in 0..5 { chars.next(); } }
+                    "#39" => { text.push('\''); for _ in 0..4 { chars.next(); } }
+                    _ => text.push('&'),
+                }
+                last_was_block = false;
+            }
+            _ if !in_tag => {
+                text.push(ch);
+                last_was_block = false;
+            }
+            _ => {}
+        }
+    }
+    text.trim().to_string()
 }

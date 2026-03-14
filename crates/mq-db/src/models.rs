@@ -118,6 +118,7 @@ pub struct DbDraft {
     pub bcc_addrs: String,
     pub subject: String,
     pub body_text: String,
+    pub body_html: String,
     pub compose_mode: String,
     pub compose_data: Option<String>,
     pub created_at: String,
