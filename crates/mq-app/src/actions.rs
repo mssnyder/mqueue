@@ -59,12 +59,70 @@ pub fn setup_actions(app: &adw::Application, window: &crate::widgets::window::Mq
     });
     window.add_action(&search_action);
 
+    // --- Message actions ---
+
+    let reply_action = gio::SimpleAction::new("reply", None);
+    let window_clone = window.clone();
+    reply_action.connect_activate(move |_, _| {
+        window_clone.activate_reply();
+    });
+    window.add_action(&reply_action);
+
+    let reply_all_action = gio::SimpleAction::new("reply-all", None);
+    let window_clone = window.clone();
+    reply_all_action.connect_activate(move |_, _| {
+        window_clone.activate_reply_all();
+    });
+    window.add_action(&reply_all_action);
+
+    let forward_action = gio::SimpleAction::new("forward", None);
+    let window_clone = window.clone();
+    forward_action.connect_activate(move |_, _| {
+        window_clone.activate_forward();
+    });
+    window.add_action(&forward_action);
+
+    let delete_action = gio::SimpleAction::new("delete", None);
+    let window_clone = window.clone();
+    delete_action.connect_activate(move |_, _| {
+        window_clone.activate_delete();
+    });
+    window.add_action(&delete_action);
+
+    let archive_action = gio::SimpleAction::new("archive", None);
+    let window_clone = window.clone();
+    archive_action.connect_activate(move |_, _| {
+        window_clone.activate_archive();
+    });
+    window.add_action(&archive_action);
+
+    let star_action = gio::SimpleAction::new("star", None);
+    let window_clone = window.clone();
+    star_action.connect_activate(move |_, _| {
+        window_clone.activate_star();
+    });
+    window.add_action(&star_action);
+
+    let read_toggle_action = gio::SimpleAction::new("read-toggle", None);
+    let window_clone = window.clone();
+    read_toggle_action.connect_activate(move |_, _| {
+        window_clone.activate_read_toggle();
+    });
+    window.add_action(&read_toggle_action);
+
     // --- Set accelerators ---
     app.set_accels_for_action("app.quit", &["<Control>q"]);
     app.set_accels_for_action("app.preferences", &["<Control>comma"]);
     app.set_accels_for_action("app.shortcuts", &["<Control>question"]);
     app.set_accels_for_action("win.compose", &["<Control>n"]);
     app.set_accels_for_action("win.search", &["<Control>f"]);
+    app.set_accels_for_action("win.reply", &["r"]);
+    app.set_accels_for_action("win.reply-all", &["<Shift>r"]);
+    app.set_accels_for_action("win.forward", &["<Shift>f"]);
+    app.set_accels_for_action("win.delete", &["Delete"]);
+    app.set_accels_for_action("win.archive", &["e"]);
+    app.set_accels_for_action("win.star", &["s"]);
+    app.set_accels_for_action("win.read-toggle", &["<Shift>u"]);
 }
 
 /// Show the keyboard shortcuts window.
@@ -84,6 +142,19 @@ fn show_shortcuts_window(window: &crate::widgets::window::MqWindow) {
     add_shortcut(&general_group, "<Control>q", "Quit");
     add_shortcut(&general_group, "<Control>question", "Keyboard shortcuts");
     section.append(&general_group);
+
+    // Messages group
+    let messages_group = gtk::ShortcutsGroup::builder()
+        .title("Messages")
+        .build();
+    add_shortcut(&messages_group, "r", "Reply");
+    add_shortcut(&messages_group, "<Shift>r", "Reply all");
+    add_shortcut(&messages_group, "<Shift>f", "Forward");
+    add_shortcut(&messages_group, "Delete", "Delete");
+    add_shortcut(&messages_group, "e", "Archive");
+    add_shortcut(&messages_group, "s", "Star");
+    add_shortcut(&messages_group, "<Shift>u", "Toggle read/unread");
+    section.append(&messages_group);
 
     let shortcuts_window = gtk::ShortcutsWindow::builder()
         .transient_for(window)

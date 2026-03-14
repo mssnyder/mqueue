@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod attachments;
 pub mod contacts;
+pub mod drafts;
 pub mod labels;
 pub mod message_bodies;
 pub mod messages;

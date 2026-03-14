@@ -32,6 +32,19 @@ pub enum OfflineOp {
         uid: u32,
         mailbox: String,
     },
+    /// Send an email (queued when SMTP fails due to network issues).
+    SendEmail {
+        from_email: String,
+        to: Vec<String>,
+        cc: Vec<String>,
+        bcc: Vec<String>,
+        subject: String,
+        body_text: String,
+        in_reply_to: Option<String>,
+        references: Option<String>,
+        /// JSON-serialized list of (filename, mime_type, base64_data) tuples.
+        attachments_json: String,
+    },
 }
 
 /// Manages the offline operation queue.
@@ -57,6 +70,7 @@ impl OfflineQueue {
             OfflineOp::StoreFlags { .. } => "store_flags",
             OfflineOp::MoveMessage { .. } => "move_message",
             OfflineOp::DeleteMessage { .. } => "delete_message",
+            OfflineOp::SendEmail { .. } => "send_email",
         };
         let payload = serde_json::to_string(&op).unwrap_or_default();
 

@@ -12,6 +12,8 @@ use tracing::info;
 const MIGRATION_001: &str = include_str!("migrations/20260312000000_initial.sql");
 /// Add contacts table.
 const MIGRATION_002: &str = include_str!("migrations/20260313000000_add_contacts.sql");
+/// Add drafts table.
+const MIGRATION_003: &str = include_str!("migrations/20260314000000_add_drafts.sql");
 
 /// Initialize the SQLite database, running migrations if needed.
 pub async fn init_pool(db_path: &Path) -> anyhow::Result<SqlitePool> {
@@ -27,7 +29,8 @@ pub async fn init_pool(db_path: &Path) -> anyhow::Result<SqlitePool> {
         .foreign_keys(true);
 
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(10)
+        .acquire_timeout(std::time::Duration::from_secs(10))
         .connect_with(options)
         .await?;
 
@@ -93,6 +96,27 @@ async fn run_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
             .execute(pool)
             .await?;
         info!("Migration 002_add_contacts applied successfully");
+    }
+
+    // Migration 003: drafts table
+    let row = sqlx::query("SELECT COUNT(*) as cnt FROM _mq_migrations WHERE name = '003_add_drafts'")
+        .fetch_one(pool)
+        .await?;
+    let count: i64 = sqlx::Row::get(&row, "cnt");
+
+    if count == 0 {
+        info!("Applying migration 003_add_drafts");
+        for statement in split_sql_statements(MIGRATION_003) {
+            let trimmed = statement.trim();
+            if !trimmed.is_empty() {
+                sqlx::query(trimmed).execute(pool).await?;
+            }
+        }
+
+        sqlx::query("INSERT INTO _mq_migrations (name) VALUES ('003_add_drafts')")
+            .execute(pool)
+            .await?;
+        info!("Migration 003_add_drafts applied successfully");
     }
 
     Ok(())

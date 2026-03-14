@@ -20,6 +20,8 @@ mod imp {
         pub search_entry: RefCell<Option<gtk::SearchEntry>>,
         pub search_button: RefCell<Option<gtk::ToggleButton>>,
         pub sort_button: RefCell<Option<gtk::MenuButton>>,
+        pub stack: RefCell<Option<gtk::Stack>>,
+        pub placeholder: RefCell<Option<adw::StatusPage>>,
         /// Suppresses selection-changed signals during model refresh.
         pub refreshing: std::rc::Rc<std::cell::Cell<bool>>,
     }
@@ -139,7 +141,33 @@ mod imp {
                 .child(&list_view)
                 .build();
 
-            widget.append(&scrolled);
+            // Empty state placeholder
+            let placeholder = adw::StatusPage::builder()
+                .icon_name("mail-inbox-symbolic")
+                .title("No messages")
+                .description("Messages you receive will appear here")
+                .vexpand(true)
+                .build();
+
+            // Stack to toggle between list and placeholder
+            let stack = gtk::Stack::builder()
+                .vexpand(true)
+                .build();
+            stack.add_named(&scrolled, Some("list"));
+            stack.add_named(&placeholder, Some("placeholder"));
+            stack.set_visible_child_name("placeholder");
+
+            // Toggle based on model item count
+            let stack_ref = stack.clone();
+            model.connect_items_changed(move |model, _, _, _| {
+                if model.n_items() > 0 {
+                    stack_ref.set_visible_child_name("list");
+                } else {
+                    stack_ref.set_visible_child_name("placeholder");
+                }
+            });
+
+            widget.append(&stack);
 
             *self.list_view.borrow_mut() = Some(list_view);
             *self.model.borrow_mut() = Some(model);
@@ -149,6 +177,8 @@ mod imp {
             *self.search_entry.borrow_mut() = Some(search_entry);
             *self.search_button.borrow_mut() = Some(search_button);
             *self.sort_button.borrow_mut() = Some(sort_button);
+            *self.stack.borrow_mut() = Some(stack);
+            *self.placeholder.borrow_mut() = Some(placeholder);
         }
     }
 
@@ -547,6 +577,26 @@ impl MqMessageList {
         group.add_action(&oldest_action);
 
         self.insert_action_group("sort", Some(&group));
+    }
+
+    /// Update the empty state placeholder text.
+    pub fn set_placeholder_text(&self, title: &str, description: &str) {
+        if let Some(placeholder) = self.imp().placeholder.borrow().as_ref() {
+            placeholder.set_title(title);
+            placeholder.set_description(Some(description));
+        }
+    }
+
+    /// Reset placeholder to default mailbox text.
+    pub fn reset_placeholder(&self) {
+        self.set_placeholder_text("No messages", "Messages you receive will appear here");
+    }
+
+    /// Insert a message at the given position (for undo re-insertion).
+    pub fn insert_message_at(&self, pos: u32, msg: &MessageObject) {
+        let model = self.model();
+        let clamped = pos.min(model.n_items());
+        model.insert(clamped, msg);
     }
 
     /// Programmatically close the search bar.

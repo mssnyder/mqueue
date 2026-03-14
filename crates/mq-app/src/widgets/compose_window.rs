@@ -69,6 +69,10 @@ mod imp {
         pub accounts: RefCell<Vec<(i64, String)>>,
         pub contacts: Rc<RefCell<Vec<ContactEntry>>>,
         pub attachments: Rc<RefCell<Vec<(String, std::path::PathBuf)>>>,
+        /// Set to true after a successful send so close_request skips the dialog.
+        pub sent_successfully: std::cell::Cell<bool>,
+        /// Draft ID if this compose is backed by a saved draft.
+        pub draft_id: RefCell<Option<i64>>,
     }
 
     #[glib::object_subclass]
@@ -240,6 +244,24 @@ mod imp {
                                 for i in 0..files.n_items() {
                                     if let Some(file) = files.item(i).and_then(|o| o.downcast::<gtk::gio::File>().ok()) {
                                         if let Some(path) = file.path() {
+                                            // Check attachment size limit (25 MB total)
+                                            let file_size = std::fs::metadata(&path)
+                                                .map(|m| m.len())
+                                                .unwrap_or(0);
+                                            let current_total: u64 = att_list.borrow().iter()
+                                                .map(|(_, p): &(String, std::path::PathBuf)| {
+                                                    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+                                                })
+                                                .sum();
+                                            if current_total + file_size > 25 * 1024 * 1024 {
+                                                let dialog = adw::AlertDialog::builder()
+                                                    .heading("File too large")
+                                                    .body("Total attachment size exceeds the 25 MB limit.")
+                                                    .build();
+                                                dialog.add_response("ok", "OK");
+                                                dialog.present(Some(&win_ref.clone().upcast::<gtk::Window>()));
+                                                continue;
+                                            }
                                             let filename = path.file_name()
                                                 .map(|n: &std::ffi::OsStr| n.to_string_lossy().to_string())
                                                 .unwrap_or_else(|| "file".to_string());
@@ -314,7 +336,43 @@ mod imp {
     }
 
     impl WidgetImpl for MqComposeWindow {}
-    impl WindowImpl for MqComposeWindow {}
+    impl WindowImpl for MqComposeWindow {
+        fn close_request(&self) -> glib::Propagation {
+            // If sent successfully or no content, close without prompting
+            if self.sent_successfully.get() {
+                return self.parent_close_request();
+            }
+
+            let window = self.obj();
+            if !window.has_content() {
+                return self.parent_close_request();
+            }
+
+            // Show discard confirmation dialog
+            let win = window.clone();
+            let dialog = adw::AlertDialog::builder()
+                .heading("Discard draft?")
+                .body("Your message has not been sent. Discard it?")
+                .close_response("cancel")
+                .default_response("cancel")
+                .build();
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("discard", "Discard");
+            dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+
+            dialog.connect_response(None, move |_, response| {
+                if response == "discard" {
+                    win.imp().sent_successfully.set(true); // skip re-prompt
+                    win.close();
+                }
+            });
+
+            dialog.present(Some(&*window));
+
+            // Inhibit the default close — the dialog callback will close if confirmed
+            glib::Propagation::Stop
+        }
+    }
     impl AdwWindowImpl for MqComposeWindow {}
 
     impl MqComposeWindow {
@@ -467,6 +525,35 @@ impl MqComposeWindow {
         win
     }
 
+    /// Returns true if any compose field has content (used for close confirmation).
+    pub fn has_content(&self) -> bool {
+        let has_to = !self.to_addresses().is_empty();
+        let has_subject = !self.subject().is_empty();
+        let has_body = {
+            let text = self.body_text();
+            // Ignore signature-only content (starts with "\n\n-- \n")
+            let trimmed = text.trim();
+            !trimmed.is_empty() && !trimmed.starts_with("-- \n")
+        };
+        let has_attachments = !self.attachments().is_empty();
+        has_to || has_subject || has_body || has_attachments
+    }
+
+    /// Mark this compose window as having sent successfully (skips close dialog).
+    pub fn set_sent_successfully(&self) {
+        self.imp().sent_successfully.set(true);
+    }
+
+    /// Get the draft ID if this compose is backed by a saved draft.
+    pub fn draft_id(&self) -> Option<i64> {
+        *self.imp().draft_id.borrow()
+    }
+
+    /// Set the draft ID.
+    pub fn set_draft_id(&self, id: i64) {
+        *self.imp().draft_id.borrow_mut() = Some(id);
+    }
+
     /// Set the available contacts for autocomplete in address fields.
     pub fn set_contacts(&self, contacts: Vec<ContactEntry>) {
         *self.imp().contacts.borrow_mut() = contacts;
@@ -594,6 +681,27 @@ impl MqComposeWindow {
                     .to_string()
             })
             .unwrap_or_default()
+    }
+
+    /// Validate all address fields. Returns a list of error messages.
+    pub fn validate_addresses(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for addr in self.to_addresses() {
+            if !is_valid_email(&addr) {
+                errors.push(format!("Invalid To address: {addr}"));
+            }
+        }
+        for addr in self.cc_addresses() {
+            if !is_valid_email(&addr) {
+                errors.push(format!("Invalid Cc address: {addr}"));
+            }
+        }
+        for addr in self.bcc_addresses() {
+            if !is_valid_email(&addr) {
+                errors.push(format!("Invalid Bcc address: {addr}"));
+            }
+        }
+        errors
     }
 
     /// Get the list of attached files: (filename, path).
@@ -779,6 +887,28 @@ fn forward_subject(subject: &str) -> String {
     } else {
         format!("Fwd: {subject}")
     }
+}
+
+/// Basic email validation: must have text@text.text form.
+fn is_valid_email(addr: &str) -> bool {
+    let addr = addr.trim();
+    // Handle "Name <email>" format
+    let email = if let Some(start) = addr.find('<') {
+        if let Some(end) = addr.find('>') {
+            &addr[start + 1..end]
+        } else {
+            addr
+        }
+    } else {
+        addr
+    };
+    let parts: Vec<&str> = email.splitn(2, '@').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    let local = parts[0];
+    let domain = parts[1];
+    !local.is_empty() && !domain.is_empty() && domain.contains('.')
 }
 
 fn quote_body(from: &str, date: &str, body: &str) -> String {

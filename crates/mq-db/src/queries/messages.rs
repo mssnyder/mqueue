@@ -506,3 +506,29 @@ pub async fn update_fts_body_text(
 
     Ok(())
 }
+
+/// Get unread message counts per mailbox.
+pub async fn get_unread_counts(
+    pool: &SqlitePool,
+    account_id: Option<i64>,
+) -> sqlx::Result<std::collections::HashMap<String, i64>> {
+    let rows: Vec<(String, i64)> = if let Some(aid) = account_id {
+        sqlx::query_as(
+            "SELECT mailbox, COUNT(*) as cnt FROM messages \
+             WHERE account_id = ? AND flags NOT LIKE '%\\Seen%' \
+             GROUP BY mailbox",
+        )
+        .bind(aid)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT mailbox, COUNT(*) as cnt FROM messages \
+             WHERE flags NOT LIKE '%\\Seen%' \
+             GROUP BY mailbox",
+        )
+        .fetch_all(pool)
+        .await?
+    };
+    Ok(rows.into_iter().collect())
+}

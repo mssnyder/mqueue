@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use adw::prelude::*;
-use gtk::gio;
+use gtk::{gio, glib};
 use sqlx::SqlitePool;
 use tracing::{debug, error, info, warn};
 
@@ -1627,11 +1627,19 @@ fn start_background_sync(
                 SyncProgress::Error(msg) => {
                     error!("Background sync error: {msg}");
                     w.hide_progress();
-                    w.show_banner(&format!("Sync error: {msg}"));
-                    let w2 = w.clone();
-                    glib::timeout_add_local_once(std::time::Duration::from_secs(5), move || {
-                        w2.hide_banner();
-                    });
+                    let is_auth = msg.to_lowercase().contains("token")
+                        || msg.to_lowercase().contains("auth")
+                        || msg.to_lowercase().contains("refresh");
+                    if is_auth {
+                        // Show persistent auth error banner
+                        w.show_banner("Session expired. Please re-authenticate via the sidebar.");
+                    } else {
+                        w.show_banner(&format!("Sync error: {msg}"));
+                        let w2 = w.clone();
+                        glib::timeout_add_local_once(std::time::Duration::from_secs(5), move || {
+                            w2.hide_banner();
+                        });
+                    }
                     break;
                 }
                 SyncProgress::Done(total) => {
@@ -1640,6 +1648,18 @@ fn start_background_sync(
                     w.hide_banner();
                     // Reload the selected thread so new messages show up
                     refresh_and_reload_selected(&w, &p, &sm);
+                    // Send desktop notification for new mail (only when window is not focused)
+                    if total > 0 && !w.is_active() {
+                        if let Some(app) = w.application() {
+                            if let Some(adw_app) = app.downcast_ref::<adw::Application>() {
+                                send_new_mail_notification(
+                                    adw_app,
+                                    &format!("{total} new"),
+                                    &format!("{total} new message{}", if total == 1 { "" } else { "s" }),
+                                );
+                            }
+                        }
+                    }
                     // Don't break — IDLE keeps the channel alive
                 }
                 SyncProgress::NewMail => {
@@ -2100,6 +2120,7 @@ fn reload_messages(
 ) {
     let mailbox = mailbox.to_string();
     let show_badge = is_multi_account && account_id.is_none();
+    let pool_for_counts = pool.clone();
     let pool = pool.clone();
     let pool2 = pool.clone();
     let emails = account_emails.clone();
@@ -2286,6 +2307,25 @@ fn reload_messages(
             }
         },
     );
+
+    // Refresh unread count badges in the sidebar
+    refresh_unread_counts(window, &pool_for_counts, account_id);
+}
+
+/// Fetch unread counts from the DB and update the sidebar badges.
+fn refresh_unread_counts(window: &MqWindow, pool: &Arc<SqlitePool>, account_id: Option<i64>) {
+    let pool = pool.clone();
+    let sidebar = window.sidebar();
+    runtime::spawn_async(
+        async move {
+            mq_db::queries::messages::get_unread_counts(&pool, account_id)
+                .await
+                .unwrap_or_default()
+        },
+        move |counts: std::collections::HashMap<String, i64>| {
+            sidebar.update_unread_counts(&counts);
+        },
+    );
 }
 
 fn db_to_message_data(messages: Vec<mq_db::models::DbMessage>) -> Vec<MessageData> {
@@ -2451,11 +2491,16 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
         }
     });
 
+    // --- Delete with undo ---
     let pool4 = pool.clone();
     let ml4 = window.message_list();
     let view4 = window.message_view();
     let del_win = window.clone();
     let del_msgs = shared_messages.clone();
+    // Shared pending-undo state: stores the timer source ID so the undo
+    // button can cancel the delayed server operation.
+    let pending_undo: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let pending_undo_del = pending_undo.clone();
     window.message_view().connect_delete_clicked(move || {
         if let Some(msg) = selected_message(&ml4) {
             let db_id = msg.db_id();
@@ -2464,42 +2509,85 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
             let mailbox = msg.mailbox();
             let pool = pool4.clone();
             debug!(db_id, "Delete clicked");
+
+            // Cancel any previous pending undo (execute it immediately)
+            if let Some(prev) = pending_undo_del.borrow_mut().take() {
+                prev.remove();
+            }
+
+            let pos = ml4.selection().selected();
             let has_remaining = ml4.model().n_items() > 1;
             remove_selected(&ml4);
             if !has_remaining {
                 view4.show_placeholder();
             }
-            // The selection model auto-selects the next message,
-            // which fires connect_message_selected to load it.
+
+            // Clone the message for potential undo re-insertion
+            let undo_msg = MessageObject::new(
+                db_id, uid,
+                &msg.sender_name(), &msg.sender_email(),
+                &msg.subject(), &msg.date(), &msg.snippet(),
+                msg.is_read(), msg.is_flagged(), msg.has_attachments(),
+                &msg.mailbox(), msg.account_id(), &msg.account_email(),
+                msg.gmail_thread_id(), msg.thread_count(),
+            );
+
+            // Set up the delayed server operation
             let sync_pool = pool.clone();
             let sync_win = del_win.clone();
             let sync_msgs = del_msgs.clone();
-            runtime::spawn_async(
-                async move {
-                    // Move to trash on IMAP server
-                    if let Err(e) = imap_trash_message(&pool, account_id, &mailbox, uid).await {
-                        warn!("Failed to trash message on server: {e}");
+            let execute = Rc::new(std::cell::Cell::new(true));
+            let execute_timer = execute.clone();
+            let pending_ref = pending_undo_del.clone();
+            let source_id = glib::timeout_add_local_once(
+                std::time::Duration::from_secs(5),
+                move || {
+                    // Clear the pending undo reference
+                    pending_ref.borrow_mut().take();
+                    if !execute_timer.get() {
+                        return;
                     }
-                    // Remove from local DB
-                    if let Err(e) =
-                        mq_db::queries::messages::delete_message(&pool, db_id).await
-                    {
-                        warn!("Failed to delete message locally: {e}");
-                    }
-                    account_id
-                },
-                move |account_id: i64| {
-                    trigger_sync_account(account_id, &sync_pool, &sync_win, &sync_msgs);
+                    runtime::spawn_async(
+                        async move {
+                            if let Err(e) = imap_trash_message(&pool, account_id, &mailbox, uid).await {
+                                warn!("Failed to trash message on server: {e}");
+                            }
+                            if let Err(e) = mq_db::queries::messages::delete_message(&pool, db_id).await {
+                                warn!("Failed to delete message locally: {e}");
+                            }
+                            account_id
+                        },
+                        move |account_id: i64| {
+                            trigger_sync_account(account_id, &sync_pool, &sync_win, &sync_msgs);
+                        },
+                    );
                 },
             );
+            *pending_undo_del.borrow_mut() = Some(source_id);
+
+            // Show undo toast
+            let toast = adw::Toast::builder()
+                .title("Message deleted")
+                .button_label("Undo")
+                .timeout(5)
+                .build();
+            let undo_ml = ml4.clone();
+            let undo_execute = execute;
+            toast.connect_button_clicked(move |_| {
+                undo_execute.set(false);
+                undo_ml.insert_message_at(pos, &undo_msg);
+            });
+            del_win.show_toast(&toast);
         }
     });
 
+    // --- Archive with undo ---
     let pool5 = pool.clone();
     let ml5 = window.message_list();
     let view5 = window.message_view();
     let arch_win = window.clone();
     let arch_msgs = shared_messages.clone();
+    let pending_undo_arch = pending_undo;
     window.message_view().connect_archive_clicked(move || {
         if let Some(msg) = selected_message(&ml5) {
             let db_id = msg.db_id();
@@ -2508,32 +2596,71 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
             let mailbox = msg.mailbox();
             let pool = pool5.clone();
             debug!(db_id, "Archive clicked");
+
+            // Cancel any previous pending undo
+            if let Some(prev) = pending_undo_arch.borrow_mut().take() {
+                prev.remove();
+            }
+
+            let pos = ml5.selection().selected();
             let has_remaining = ml5.model().n_items() > 1;
             remove_selected(&ml5);
             if !has_remaining {
                 view5.show_placeholder();
             }
+
+            let undo_msg = MessageObject::new(
+                db_id, uid,
+                &msg.sender_name(), &msg.sender_email(),
+                &msg.subject(), &msg.date(), &msg.snippet(),
+                msg.is_read(), msg.is_flagged(), msg.has_attachments(),
+                &msg.mailbox(), msg.account_id(), &msg.account_email(),
+                msg.gmail_thread_id(), msg.thread_count(),
+            );
+
             let sync_pool = pool.clone();
             let sync_win = arch_win.clone();
             let sync_msgs = arch_msgs.clone();
-            runtime::spawn_async(
-                async move {
-                    // Move to All Mail on IMAP server (Gmail archive)
-                    if let Err(e) = imap_archive_message(&pool, account_id, &mailbox, uid).await {
-                        warn!("Failed to archive message on server: {e}");
+            let execute = Rc::new(std::cell::Cell::new(true));
+            let execute_timer = execute.clone();
+            let pending_ref = pending_undo_arch.clone();
+            let source_id = glib::timeout_add_local_once(
+                std::time::Duration::from_secs(5),
+                move || {
+                    pending_ref.borrow_mut().take();
+                    if !execute_timer.get() {
+                        return;
                     }
-                    // Remove from local DB (will be re-fetched on sync as All Mail)
-                    if let Err(e) =
-                        mq_db::queries::messages::delete_message(&pool, db_id).await
-                    {
-                        warn!("Failed to delete archived message locally: {e}");
-                    }
-                    account_id
-                },
-                move |account_id: i64| {
-                    trigger_sync_account(account_id, &sync_pool, &sync_win, &sync_msgs);
+                    runtime::spawn_async(
+                        async move {
+                            if let Err(e) = imap_archive_message(&pool, account_id, &mailbox, uid).await {
+                                warn!("Failed to archive message on server: {e}");
+                            }
+                            if let Err(e) = mq_db::queries::messages::delete_message(&pool, db_id).await {
+                                warn!("Failed to delete archived message locally: {e}");
+                            }
+                            account_id
+                        },
+                        move |account_id: i64| {
+                            trigger_sync_account(account_id, &sync_pool, &sync_win, &sync_msgs);
+                        },
+                    );
                 },
             );
+            *pending_undo_arch.borrow_mut() = Some(source_id);
+
+            let toast = adw::Toast::builder()
+                .title("Message archived")
+                .button_label("Undo")
+                .timeout(5)
+                .build();
+            let undo_ml = ml5.clone();
+            let undo_execute = execute;
+            toast.connect_button_clicked(move |_| {
+                undo_execute.set(false);
+                undo_ml.insert_message_at(pos, &undo_msg);
+            });
+            arch_win.show_toast(&toast);
         }
     });
 }
@@ -2772,6 +2899,8 @@ fn open_compose_impl(
     let refresh_window: Option<MqWindow> = shared_messages.as_ref().map(|_| window.clone());
     let refresh_pool_ref: Option<Arc<SqlitePool>> = shared_messages.as_ref().map(|_| pool.clone());
     let refresh_shared: Option<Rc<RefCell<Vec<MessageData>>>> = shared_messages.clone();
+    let send_pool = pool.clone();
+    let send_window = window.clone();
     compose.connect_send(move || {
         let Some((send_account_id, from_email)) = compose_ref.selected_account() else {
             warn!("No account selected for sending");
@@ -2781,6 +2910,14 @@ fn open_compose_impl(
         let to = compose_ref.to_addresses();
         if to.is_empty() {
             warn!("No recipients specified");
+            return;
+        }
+
+        // Validate email addresses
+        let validation_errors = compose_ref.validate_addresses();
+        if !validation_errors.is_empty() {
+            let toast = adw::Toast::new(&validation_errors[0]);
+            send_window.show_toast(&toast);
             return;
         }
 
@@ -2820,6 +2957,9 @@ fn open_compose_impl(
         let refresh_win = refresh_window.clone();
         let refresh_pool = refresh_pool_ref.clone();
         let refresh_msgs = refresh_shared.clone();
+        let queue_pool = send_pool.clone();
+        let toast_win = send_window.clone();
+        // "queued" signals the callback that the email was queued offline (not sent immediately)
         runtime::spawn_async(
             async move {
                 // Get access token from keyring
@@ -2836,7 +2976,7 @@ fn open_compose_impl(
 
                 // Try sending with the current access token
                 match mq_core::smtp::send_email(&email, &access_token).await {
-                    Ok(()) => Ok(()),
+                    Ok(()) => Ok("sent".to_string()),
                     Err(e) if e.is_auth_failure() => {
                         // Token may be expired — refresh and retry once
                         info!("Auth failure, refreshing token and retrying");
@@ -2845,28 +2985,65 @@ fn open_compose_impl(
                             .map_err(|e| format!("Token refresh failed: {e}"))?;
                         mq_core::smtp::send_email(&email, &new_token)
                             .await
+                            .map(|()| "sent".to_string())
                             .map_err(|e| format!("Send failed after token refresh: {e}"))
+                    }
+                    Err(e) if e.is_retryable() => {
+                        // Network/transient error — queue for offline retry
+                        info!("Send failed with retryable error, queuing for offline retry");
+                        let attachments_json = serde_json::to_string(&email.attachments
+                            .iter()
+                            .map(|(name, mime, data)| {
+                                use base64::Engine;
+                                (name.clone(), mime.clone(), base64::engine::general_purpose::STANDARD.encode(data))
+                            })
+                            .collect::<Vec<(String, String, String)>>(),
+                        ).unwrap_or_default();
+                        let queue = mq_net::queue::OfflineQueue::new(queue_pool);
+                        let op = mq_net::queue::OfflineOp::SendEmail {
+                            from_email: email.from_email.clone(),
+                            to: email.to.clone(),
+                            cc: email.cc.clone(),
+                            bcc: email.bcc.clone(),
+                            subject: email.subject.clone(),
+                            body_text: email.body_text.clone(),
+                            in_reply_to: email.in_reply_to.clone(),
+                            references: email.references.clone(),
+                            attachments_json,
+                        };
+                        match queue.enqueue(send_account_id, op).await {
+                            Ok(_) => Ok("queued".to_string()),
+                            Err(queue_err) => Err(format!("Failed to queue email: {queue_err}")),
+                        }
                     }
                     Err(e) => Err(format!("Failed to send email: {e}")),
                 }
             },
-            move |result: Result<(), String>| match result {
-                Ok(()) => {
-                    info!("Email sent successfully, closing compose window");
+            move |result: Result<String, String>| match result {
+                Ok(status) => {
+                    compose_close.set_sent_successfully();
                     compose_close.close();
-                    // Refresh the message list + thread view to show the sent reply
-                    if let (Some(win), Some(pool), Some(msgs)) =
-                        (refresh_win.as_ref(), refresh_pool.as_ref(), refresh_msgs.as_ref())
-                    {
-                        refresh_and_reload_selected(win, pool, msgs);
-                        // Trigger a full IMAP sync so the sent message appears in local cache
-                        trigger_sync_account(send_account_id, pool, win, msgs);
+                    if status == "queued" {
+                        info!("Email queued for offline send");
+                        let toast = adw::Toast::new("Email queued \u{2014} will send when online");
+                        toast_win.show_toast(&toast);
+                    } else {
+                        info!("Email sent successfully, closing compose window");
+                        // Refresh the message list + thread view to show the sent reply
+                        if let (Some(win), Some(pool), Some(msgs)) =
+                            (refresh_win.as_ref(), refresh_pool.as_ref(), refresh_msgs.as_ref())
+                        {
+                            refresh_and_reload_selected(win, pool, msgs);
+                            trigger_sync_account(send_account_id, pool, win, msgs);
+                        }
                     }
                 }
                 Err(e) => {
                     error!("Failed to send: {e}");
                     // Restore compose window so user can retry
                     compose_close.set_sending(false);
+                    let toast = adw::Toast::new(&format!("Send failed: {e}"));
+                    toast_win.show_toast(&toast);
                 }
             },
         );
@@ -2895,56 +3072,76 @@ fn wire_privacy_buttons(
         view.connect_unsubscribe_clicked(move || {
             if let Some(msg) = selected_message(&ml) {
                 let db_id = msg.db_id();
-                let msgs = msgs.borrow();
-                let msg_data = msgs.iter().find(|m| m.db_id == db_id);
 
-                if let Some(data) = msg_data {
-                    if let Some(ref header) = data.list_unsubscribe {
-                        let info = mq_core::privacy::unsubscribe::UnsubscribeInfo::parse(
-                            header,
-                            data.list_unsubscribe_post.as_deref(),
-                        );
+                // Show confirmation dialog before unsubscribing
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Unsubscribe?")
+                    .body("This will send an unsubscribe request and move the message to trash.")
+                    .close_response("cancel")
+                    .default_response("cancel")
+                    .build();
+                dialog.add_response("cancel", "Cancel");
+                dialog.add_response("unsub", "Unsubscribe");
+                dialog.set_response_appearance("unsub", adw::ResponseAppearance::Destructive);
 
-                        match info.recommended_action() {
-                            Some(mq_core::privacy::unsubscribe::UnsubscribeAction::OneClickPost {
-                                url,
-                            }) => {
-                                info!(%url, "One-click unsubscribe (RFC 8058)");
-                                let pool = pool.clone();
-                                let ml = ml.clone();
-                                let w = w.clone();
-                                runtime::spawn_async(
-                                    async move {
-                                        mq_core::privacy::unsubscribe::one_click_unsubscribe(&url)
-                                            .await
-                                    },
-                                    move |result| match result {
-                                        Ok(()) => {
-                                            info!("Unsubscribe successful");
-                                            // Delete the message
-                                            let db_id_del = db_id;
-                                            remove_selected(&ml);
-                                            w.message_view().show_placeholder();
-                                            runtime::spawn_async(
-                                                async move {
-                                                    let _ = mq_db::queries::messages::delete_message(
-                                                        &pool, db_id_del,
-                                                    )
-                                                    .await;
-                                                },
-                                                |_| {},
-                                            );
-                                        }
-                                        Err(e) => {
-                                            error!("Unsubscribe failed: {e}");
-                                            w.show_banner(&format!(
-                                                "Unsubscribe failed: {}",
-                                                e.user_message()
-                                            ));
-                                        }
-                                    },
-                                );
-                            }
+                let msgs_ref = msgs.clone();
+                let pool_ref = pool.clone();
+                let ml_ref = ml.clone();
+                let w_ref = w.clone();
+                dialog.connect_response(None, move |_, response| {
+                    if response != "unsub" {
+                        return;
+                    }
+
+                    let msgs = msgs_ref.borrow();
+                    let msg_data = msgs.iter().find(|m| m.db_id == db_id);
+
+                    if let Some(data) = msg_data {
+                        if let Some(ref header) = data.list_unsubscribe {
+                            let info = mq_core::privacy::unsubscribe::UnsubscribeInfo::parse(
+                                header,
+                                data.list_unsubscribe_post.as_deref(),
+                            );
+
+                            match info.recommended_action() {
+                                Some(mq_core::privacy::unsubscribe::UnsubscribeAction::OneClickPost {
+                                    url,
+                                }) => {
+                                    info!(%url, "One-click unsubscribe (RFC 8058)");
+                                    let pool = pool_ref.clone();
+                                    let ml = ml_ref.clone();
+                                    let w = w_ref.clone();
+                                    runtime::spawn_async(
+                                        async move {
+                                            mq_core::privacy::unsubscribe::one_click_unsubscribe(&url)
+                                                .await
+                                        },
+                                        move |result| match result {
+                                            Ok(()) => {
+                                                info!("Unsubscribe successful");
+                                                let db_id_del = db_id;
+                                                remove_selected(&ml);
+                                                w.message_view().show_placeholder();
+                                                runtime::spawn_async(
+                                                    async move {
+                                                        let _ = mq_db::queries::messages::delete_message(
+                                                            &pool, db_id_del,
+                                                        )
+                                                        .await;
+                                                    },
+                                                    |_| {},
+                                                );
+                                            }
+                                            Err(e) => {
+                                                error!("Unsubscribe failed: {e}");
+                                                w.show_banner(&format!(
+                                                    "Unsubscribe failed: {}",
+                                                    e.user_message()
+                                                ));
+                                            }
+                                        },
+                                    );
+                                }
                             Some(
                                 mq_core::privacy::unsubscribe::UnsubscribeAction::OpenInBrowser {
                                     url,
@@ -2973,6 +3170,8 @@ fn wire_privacy_buttons(
                         }
                     }
                 }
+                });
+                dialog.present(Some(&w.clone().upcast::<gtk::Window>()));
             }
         });
     }
@@ -3297,7 +3496,6 @@ fn wire_network_awareness(
 ///
 /// Called when IDLE detects new messages after a sync. Will be wired
 /// into the full IDLE → sync → notify pipeline once token storage is complete.
-#[allow(dead_code)]
 fn send_new_mail_notification(app: &adw::Application, sender: &str, subject: &str) {
     let notification = gio::Notification::new("New mail");
     let body = format!("{sender}: {subject}");

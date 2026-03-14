@@ -19,6 +19,7 @@ mod imp {
         pub split_view: RefCell<Option<adw::NavigationSplitView>>,
         pub banner: RefCell<Option<adw::Banner>>,
         pub progress_bar: RefCell<Option<gtk::ProgressBar>>,
+        pub toast_overlay: RefCell<Option<adw::ToastOverlay>>,
     }
 
     #[glib::object_subclass]
@@ -95,7 +96,11 @@ mod imp {
 
             main_box.append(&split_view);
 
-            window.set_content(Some(&main_box));
+            // Wrap everything in a ToastOverlay for undo toasts
+            let toast_overlay = adw::ToastOverlay::new();
+            toast_overlay.set_child(Some(&main_box));
+
+            window.set_content(Some(&toast_overlay));
 
             // --- Adaptive breakpoints ---
             // Collapse the inner OverlaySplitView when the window is narrow
@@ -140,6 +145,7 @@ mod imp {
             *self.split_view.borrow_mut() = Some(split_view);
             *self.banner.borrow_mut() = Some(banner);
             *self.progress_bar.borrow_mut() = Some(progress_bar);
+            *self.toast_overlay.borrow_mut() = Some(toast_overlay);
         }
     }
 
@@ -222,6 +228,13 @@ impl MqWindow {
         }
     }
 
+    /// Show a toast notification (e.g., undo feedback).
+    pub fn show_toast(&self, toast: &adw::Toast) {
+        if let Some(overlay) = self.imp().toast_overlay.borrow().clone() {
+            overlay.add_toast(toast.clone());
+        }
+    }
+
     /// Show the preferences window.
     pub fn show_preferences(&self) {
         use super::preferences::MqPreferences;
@@ -294,12 +307,68 @@ impl MqWindow {
         }
     }
 
+    /// Activate reply (triggered by 'r' shortcut).
+    pub fn activate_reply(&self) {
+        if let Some(btn) = self.message_view().imp().reply_button.borrow().as_ref() {
+            btn.emit_clicked();
+        }
+    }
+
+    /// Activate reply-all (triggered by Shift+R shortcut).
+    pub fn activate_reply_all(&self) {
+        if let Some(btn) = self.message_view().imp().reply_all_button.borrow().as_ref() {
+            btn.emit_clicked();
+        }
+    }
+
+    /// Activate forward (triggered by Shift+F shortcut).
+    pub fn activate_forward(&self) {
+        if let Some(btn) = self.message_view().imp().forward_button.borrow().as_ref() {
+            btn.emit_clicked();
+        }
+    }
+
+    /// Activate delete (triggered by Delete shortcut).
+    pub fn activate_delete(&self) {
+        if let Some(btn) = self.message_view().imp().delete_button.borrow().as_ref() {
+            btn.emit_clicked();
+        }
+    }
+
+    /// Activate archive (triggered by 'e' shortcut).
+    pub fn activate_archive(&self) {
+        if let Some(btn) = self.message_view().imp().archive_button.borrow().as_ref() {
+            btn.emit_clicked();
+        }
+    }
+
+    /// Toggle star (triggered by 's' shortcut).
+    pub fn activate_star(&self) {
+        if let Some(btn) = self.message_view().imp().star_button.borrow().as_ref() {
+            btn.set_active(!btn.is_active());
+        }
+    }
+
+    /// Toggle read/unread (triggered by Shift+U shortcut).
+    pub fn activate_read_toggle(&self) {
+        if let Some(btn) = self.message_view().imp().read_button.borrow().as_ref() {
+            btn.set_active(!btn.is_active());
+        }
+    }
+
     /// Toggle the search bar (triggered by Ctrl+F).
     pub fn activate_search(&self) {
         let list = self.message_list();
         let btn = list.imp().search_button.borrow().clone();
         if let Some(btn) = btn {
-            btn.set_active(!btn.is_active());
+            let will_activate = !btn.is_active();
+            btn.set_active(will_activate);
+            // Auto-focus the search entry when opening
+            if will_activate {
+                if let Some(entry) = list.imp().search_entry.borrow().as_ref() {
+                    entry.grab_focus();
+                }
+            }
         }
     }
 }

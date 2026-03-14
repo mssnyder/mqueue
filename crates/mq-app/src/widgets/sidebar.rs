@@ -250,6 +250,14 @@ mod imp {
                 .build();
             hbox.append(&label);
 
+            // Unread count badge (hidden by default)
+            let badge = gtk::Label::builder()
+                .css_classes(["dim-label", "caption"])
+                .visible(false)
+                .build();
+            badge.set_widget_name("unread_badge");
+            hbox.append(&badge);
+
             let row = gtk::ListBoxRow::builder().child(&hbox).build();
 
             // Store the IMAP name as widget name for lookup
@@ -445,6 +453,38 @@ impl MqSidebar {
                     imap_name,
                 );
                 list_box.append(&row);
+            }
+        }
+    }
+
+    /// Update unread count badges on mailbox rows.
+    pub fn update_unread_counts(&self, counts: &std::collections::HashMap<String, i64>) {
+        if let Some(list_box) = self.imp().mailbox_list.borrow().as_ref() {
+            let mut i = 0;
+            while let Some(row) = list_box.row_at_index(i) {
+                let mailbox = row.widget_name().to_string();
+                if let Some(child) = row.child() {
+                    if let Ok(hbox) = child.downcast::<gtk::Box>() {
+                        // Find the badge label by widget name
+                        let mut c = hbox.first_child();
+                        while let Some(widget) = c {
+                            if widget.widget_name() == "unread_badge" {
+                                if let Ok(label) = widget.downcast::<gtk::Label>() {
+                                    let count = counts.get(&mailbox).copied().unwrap_or(0);
+                                    if count > 0 {
+                                        label.set_label(&count.to_string());
+                                        label.set_visible(true);
+                                    } else {
+                                        label.set_visible(false);
+                                    }
+                                }
+                                break;
+                            }
+                            c = widget.next_sibling();
+                        }
+                    }
+                }
+                i += 1;
             }
         }
     }

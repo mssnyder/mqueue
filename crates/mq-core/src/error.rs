@@ -34,10 +34,19 @@ pub enum MqError {
 impl MqError {
     /// Whether this error is transient and the operation should be retried.
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            MqError::Imap(_) | MqError::Smtp(_) | MqError::Network(_) | MqError::Offline
-        )
+        match self {
+            MqError::Imap(e) => {
+                let msg = e.to_string().to_lowercase();
+                // Don't retry auth failures or permanent IMAP errors
+                !msg.contains("auth")
+                    && !msg.contains("login")
+                    && !msg.contains("no such mailbox")
+                    && !msg.contains("nonexistent")
+            }
+            MqError::Smtp(e) => e.is_transient(),
+            MqError::Network(_) | MqError::Offline => true,
+            _ => false,
+        }
     }
 
     /// Whether this error indicates an authentication failure.
