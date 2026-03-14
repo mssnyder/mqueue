@@ -10,7 +10,7 @@ use super::message_object::MessageObject;
 mod imp {
     use super::*;
 
-    #[derive(Debug, Default)]
+    #[derive(Default)]
     pub struct MqMessageList {
         pub list_view: RefCell<Option<gtk::ListView>>,
         pub model: RefCell<Option<gio::ListStore>>,
@@ -22,8 +22,19 @@ mod imp {
         pub sort_button: RefCell<Option<gtk::MenuButton>>,
         pub stack: RefCell<Option<gtk::Stack>>,
         pub placeholder: RefCell<Option<adw::StatusPage>>,
+        pub scrolled_window: RefCell<Option<gtk::ScrolledWindow>>,
         /// Suppresses selection-changed signals during model refresh.
         pub refreshing: std::rc::Rc<std::cell::Cell<bool>>,
+        /// Whether a load-more fetch is currently in progress (prevents duplicate requests).
+        pub loading_more: std::rc::Rc<std::cell::Cell<bool>>,
+        /// Callback fired when the user scrolls near the bottom.
+        pub load_more_callback: std::rc::Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    }
+
+    impl std::fmt::Debug for MqMessageList {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("MqMessageList").finish_non_exhaustive()
+        }
     }
 
     #[glib::object_subclass]
@@ -141,6 +152,27 @@ mod imp {
                 .child(&list_view)
                 .build();
 
+            // Detect scroll near bottom for load-more pagination
+            {
+                let loading_more = self.loading_more.clone();
+                let load_more_cb = self.load_more_callback.clone();
+                let adj = scrolled.vadjustment();
+                adj.connect_value_changed(move |adj| {
+                    let value = adj.value();
+                    let upper = adj.upper();
+                    let page_size = adj.page_size();
+                    if upper > page_size
+                        && value + page_size >= upper - 200.0
+                        && !loading_more.get()
+                    {
+                        loading_more.set(true);
+                        if let Some(ref cb) = *load_more_cb.borrow() {
+                            cb();
+                        }
+                    }
+                });
+            }
+
             // Empty state placeholder
             let placeholder = adw::StatusPage::builder()
                 .icon_name("mail-inbox-symbolic")
@@ -179,6 +211,7 @@ mod imp {
             *self.sort_button.borrow_mut() = Some(sort_button);
             *self.stack.borrow_mut() = Some(stack);
             *self.placeholder.borrow_mut() = Some(placeholder);
+            *self.scrolled_window.borrow_mut() = Some(scrolled);
         }
     }
 
@@ -425,6 +458,8 @@ impl MqMessageList {
     pub fn set_messages(&self, messages: Vec<MessageObject>) {
         let model = self.model();
         let selection = self.selection();
+        // Reset load-more state on full reload (e.g. mailbox switch)
+        self.imp().loading_more.set(false);
         model.remove_all();
         for msg in messages {
             model.append(&msg);
@@ -597,6 +632,27 @@ impl MqMessageList {
         let model = self.model();
         let clamped = pos.min(model.n_items());
         model.insert(clamped, msg);
+    }
+
+    /// Connect a callback for when the user scrolls near the bottom (load-more pagination).
+    pub fn connect_load_more<F: Fn() + 'static>(&self, f: F) {
+        *self.imp().load_more_callback.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Append messages to the end of the list (for pagination).
+    /// Does not reset the selection.
+    pub fn append_messages(&self, messages: Vec<MessageObject>) {
+        let model = self.model();
+        for msg in messages {
+            model.append(&msg);
+        }
+        // Allow future load-more triggers
+        self.imp().loading_more.set(false);
+    }
+
+    /// Signal that a load-more attempt returned no results (no more pages).
+    pub fn load_more_finished(&self) {
+        self.imp().loading_more.set(false);
     }
 
     /// Programmatically close the search bar.

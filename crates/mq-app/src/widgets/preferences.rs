@@ -310,6 +310,21 @@ impl MqPreferences {
         }
     }
 
+    /// Connect a callback that fires when the theme selection changes (for live preview).
+    pub fn connect_theme_changed<F: Fn(Theme) + 'static>(&self, f: F) {
+        if let Some(row) = self.imp().theme_row.borrow().as_ref() {
+            row.connect_selected_notify(move |row| {
+                let theme = match row.selected() {
+                    0 => Theme::System,
+                    1 => Theme::Light,
+                    2 => Theme::Dark,
+                    _ => Theme::System,
+                };
+                f(theme);
+            });
+        }
+    }
+
     /// Read current UI state back into an AppConfig.
     pub fn collect_config(&self) -> AppConfig {
         let imp = self.imp();

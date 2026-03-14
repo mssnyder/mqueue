@@ -4,6 +4,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use adw::prelude::*;
+use adw::subclass::prelude::ObjectSubclassIsExt;
 use gtk::{gio, glib};
 use sqlx::SqlitePool;
 use tracing::{debug, error, info, warn};
@@ -360,10 +361,15 @@ fn setup_ui(window: MqWindow, data: AppData) -> Rc<RefCell<Vec<MessageData>>> {
         let view = window.message_view();
         let pool_sel = pool.clone();
         let msgs = shared_messages.clone();
+        let win_gen = window.clone();
 
         window
             .message_list()
             .connect_message_selected(move |msg| {
+                // Bump generation so any in-flight body loads are discarded.
+                let my_gen = win_gen.bump_body_load_generation();
+                let gen_win = win_gen.clone();
+
                 let db_id = msg.db_id();
                 let from = if msg.sender_name().is_empty() {
                     msg.sender_email()
@@ -532,6 +538,11 @@ fn setup_ui(window: MqWindow, data: AppData) -> Rc<RefCell<Vec<MessageData>>> {
                         bool,
                         Vec<(i64, String, String, Option<u64>)>,
                     )| {
+                        // Discard stale result if user has already selected another message.
+                        if gen_win.body_load_generation() != my_gen {
+                            return;
+                        }
+
                         if let Some(conversation) = conversation {
                             // Thread view: show full conversation
                             v.set_conversation(&conversation);
@@ -626,6 +637,8 @@ fn setup_ui(window: MqWindow, data: AppData) -> Rc<RefCell<Vec<MessageData>>> {
         let account = msg.account_id();
         let uid = msg.uid();
         let mailbox = msg.mailbox();
+        let my_gen = window.body_load_generation();
+        let gen_win2 = window.clone();
         let thread_id = msg.gmail_thread_id();
         let thread_count = msg.thread_count();
         runtime::spawn_async(
@@ -729,6 +742,8 @@ fn setup_ui(window: MqWindow, data: AppData) -> Rc<RefCell<Vec<MessageData>>> {
                 bool,
                 Vec<(i64, String, String, Option<u64>)>,
             )| {
+                if gen_win2.body_load_generation() != my_gen { return; }
+
                 if let Some(conversation) = conversation {
                     v.set_conversation(&conversation);
                 } else if let Some(body) = body {
@@ -784,7 +799,9 @@ fn setup_ui(window: MqWindow, data: AppData) -> Rc<RefCell<Vec<MessageData>>> {
         let ml = window.message_list();
         let ml2 = ml.clone();
         let msgs = shared_messages.clone();
+        let sort_win = window.clone();
         ml.connect_sort_changed(move |newest_first| {
+            sort_win.imp().sort_newest_first.set(newest_first);
             let model = ml2.model();
             let n = model.n_items();
             if n == 0 {
@@ -819,6 +836,48 @@ fn setup_ui(window: MqWindow, data: AppData) -> Rc<RefCell<Vec<MessageData>>> {
             }
 
             ml2.refresh_messages(items);
+        });
+    }
+
+    // Wire load-more pagination: when user scrolls near bottom, fetch next batch
+    {
+        let w = window.clone();
+        let p = pool.clone();
+        let m = shared_messages.clone();
+        let e = account_emails.clone();
+        let n = data.accounts.len();
+        window.message_list().connect_load_more(move || {
+            let mailbox = w.sidebar().selected_mailbox();
+            let account_id = w.sidebar().selected_account_id();
+            let current_count = m.borrow().len() as i64;
+            let pool = p.clone();
+            let msgs = m.clone();
+            let emails = e.clone();
+            let ml = w.message_list();
+            let show_badge = n > 1 && account_id.is_none();
+            let sort_newest = w.imp().sort_newest_first.get();
+            runtime::spawn_async(
+                async move {
+                    mq_db::queries::messages::get_threads_for_mailbox(
+                        &pool, &mailbox, 200, current_count,
+                    )
+                    .await
+                    .unwrap_or_default()
+                },
+                move |threads: Vec<(mq_db::models::DbMessage, i64)>| {
+                    if threads.is_empty() {
+                        ml.load_more_finished();
+                        return;
+                    }
+                    let mut data = db_to_threaded_message_data(threads);
+                    if !sort_newest {
+                        data.sort_by(|a, b| a.date.cmp(&b.date));
+                    }
+                    let objects = make_message_objects(&data, &emails, show_badge);
+                    msgs.borrow_mut().extend(data);
+                    ml.append_messages(objects);
+                },
+            );
         });
     }
 
@@ -869,7 +928,7 @@ fn setup_ui(window: MqWindow, data: AppData) -> Rc<RefCell<Vec<MessageData>>> {
             // Confirmation dialog
             let dialog = adw::AlertDialog::builder()
                 .heading("Remove Account")
-                .body(format!("Remove {email} and all its cached messages?"))
+                .body(format!("This will permanently remove all cached emails, contacts, and settings for {email}. This cannot be undone."))
                 .build();
             dialog.add_response("cancel", "Cancel");
             dialog.add_response("remove", "Remove");
@@ -973,6 +1032,15 @@ fn setup_ui(window: MqWindow, data: AppData) -> Rc<RefCell<Vec<MessageData>>> {
 
     // Wire network awareness (offline banner + reconnect)
     wire_network_awareness(&window, &pool, &account_emails, is_multi_account, &shared_messages);
+
+    // Wire the banner's action button to trigger a re-sync (used for sync error retry)
+    {
+        let w = window.clone();
+        window.connect_banner_button(move || {
+            w.hide_banner();
+            adw::prelude::ActionGroupExt::activate_action(&w, "app.resync", None);
+        });
+    }
 
     shared_messages
 }
@@ -1634,11 +1702,8 @@ fn start_background_sync(
                         // Show persistent auth error banner
                         w.show_banner("Session expired. Please re-authenticate via the sidebar.");
                     } else {
-                        w.show_banner(&format!("Sync error: {msg}"));
-                        let w2 = w.clone();
-                        glib::timeout_add_local_once(std::time::Duration::from_secs(5), move || {
-                            w2.hide_banner();
-                        });
+                        // Show error with retry button (no auto-dismiss)
+                        w.show_banner_with_action(&format!("Sync error: {msg}"), "Retry");
                     }
                     break;
                 }
@@ -1853,6 +1918,8 @@ fn refresh_message_list_impl(
     let pool2 = pool.clone();
     let msgs = shared_messages.clone();
     let msgs2 = shared_messages.clone();
+    let my_gen = window.body_load_generation();
+    let gen_win = window.clone();
     // Use the currently selected mailbox, not hardcoded INBOX
     let current_mailbox = window.sidebar().selected_mailbox();
     runtime::spawn_async(
@@ -1936,6 +2003,7 @@ fn refresh_message_list_impl(
                         let pool_dl3 = pool2.clone();
                         let sender = msg.sender_email();
                         let account = msg.account_id();
+                        let gen_win3 = gen_win.clone();
                         runtime::spawn_async(
                             async move {
                                 let allowed =
@@ -1973,6 +2041,7 @@ fn refresh_message_list_impl(
                                 bool,
                                 Vec<(i64, String, String, Option<u64>)>,
                             )| {
+                                if gen_win3.body_load_generation() != my_gen { return; }
                                 if let Some(body) = body {
                                     if let Some(ref html) = body.html {
                                         v.set_body_html(html);
@@ -2128,6 +2197,11 @@ fn reload_messages(
     let msgs2 = shared_messages.clone();
     let ml = window.message_list();
     let mv = window.message_view();
+    let my_gen = window.body_load_generation();
+    let gen_win = window.clone();
+
+    // Set context-aware placeholder text for this mailbox
+    set_mailbox_placeholder(&ml, &mailbox);
 
     runtime::spawn_async(
         async move {
@@ -2144,6 +2218,11 @@ fn reload_messages(
             Arc<HashMap<i64, String>>,
             bool,
         )| {
+            let mut messages = messages;
+            // Apply persisted sort order
+            if !gen_win.imp().sort_newest_first.get() {
+                messages.sort_by(|a, b| a.date.cmp(&b.date));
+            }
             let objects = make_message_objects(&messages, &emails, show_badge);
             let has_messages = !objects.is_empty();
             // Update shared state so the selection handler has current data
@@ -2197,6 +2276,7 @@ fn reload_messages(
                     let account = msg.account_id();
                     let thread_id = msg.gmail_thread_id();
                     let thread_count = msg.thread_count();
+                    let gen_win4 = gen_win.clone();
                     runtime::spawn_async(
                         async move {
                             let allowed =
@@ -2274,6 +2354,7 @@ fn reload_messages(
                             usize,
                             Vec<(i64, String, String, Option<u64>)>,
                         )| {
+                            if gen_win4.body_load_generation() != my_gen { return; }
                             if let Some(ref conv) = conversation {
                                 v.set_conversation(conv);
                             } else if let Some(body) = body {
@@ -2433,6 +2514,7 @@ fn make_message_objects(
 fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_messages: &Rc<RefCell<Vec<MessageData>>>) {
     let pool2 = pool.clone();
     let ml2 = window.message_list();
+    let star_win = window.clone();
     window
         .message_view()
         .connect_star_toggled(move |starred| {
@@ -2449,21 +2531,28 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
                     async move { toggle_flag(&pool, db_id, "\\Flagged", starred).await },
                     |_| {},
                 );
+                let msg_revert = msg.clone();
+                let w = star_win.clone();
                 runtime::spawn_async(
                     async move {
-                        if let Err(e) = imap_store_flag(
+                        imap_store_flag(
                             &pool_imap, account_id, &mailbox, uid, "\\Flagged", starred,
-                        ).await {
+                        ).await
+                    },
+                    move |result: Result<(), Box<dyn std::error::Error + Send + Sync>>| {
+                        if let Err(e) = result {
                             warn!("Failed to sync star flag to server: {e}");
+                            msg_revert.set_is_flagged(!starred);
+                            w.show_toast(&adw::Toast::new("Failed to sync \u{2014} will retry on next sync"));
                         }
                     },
-                    |_| {},
                 );
             }
         });
 
     let pool3 = pool.clone();
     let ml3 = window.message_list();
+    let read_win = window.clone();
     window.message_view().connect_read_toggled(move |read| {
         if let Some(msg) = selected_message(&ml3) {
             let db_id = msg.db_id();
@@ -2478,15 +2567,21 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
                 async move { toggle_flag(&pool, db_id, "\\Seen", read).await },
                 |_| {},
             );
+            let msg_revert = msg.clone();
+            let w = read_win.clone();
             runtime::spawn_async(
                 async move {
-                    if let Err(e) = imap_store_flag(
+                    imap_store_flag(
                         &pool_imap, account_id, &mailbox, uid, "\\Seen", read,
-                    ).await {
+                    ).await
+                },
+                move |result: Result<(), Box<dyn std::error::Error + Send + Sync>>| {
+                    if let Err(e) = result {
                         warn!("Failed to sync read flag to server: {e}");
+                        msg_revert.set_is_read(!read);
+                        w.show_toast(&adw::Toast::new("Failed to sync \u{2014} will retry on next sync"));
                     }
                 },
-                |_| {},
             );
         }
     });
@@ -2576,6 +2671,7 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
             toast.connect_button_clicked(move |_| {
                 undo_execute.set(false);
                 undo_ml.insert_message_at(pos, &undo_msg);
+                undo_ml.selection().set_selected(pos);
             });
             del_win.show_toast(&toast);
         }
@@ -2659,6 +2755,7 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
             toast.connect_button_clicked(move |_| {
                 undo_execute.set(false);
                 undo_ml.insert_message_at(pos, &undo_msg);
+                undo_ml.selection().set_selected(pos);
             });
             arch_win.show_toast(&toast);
         }
@@ -2890,6 +2987,35 @@ fn open_compose_impl(
     );
 
     compose.apply_mode(&mode, &signature);
+
+    // Wire "Save Draft" callback for close dialog
+    {
+        let draft_pool = pool.clone();
+        compose.set_save_draft_callback(move |compose_win| {
+            let account = compose_win.selected_account();
+            let (account_id, _) = match account {
+                Some(a) => a,
+                None => return,
+            };
+            let to = compose_win.to_addresses().join(", ");
+            let cc = compose_win.cc_addresses().join(", ");
+            let bcc = compose_win.bcc_addresses().join(", ");
+            let subject = compose_win.subject();
+            let body = compose_win.body_text();
+            let draft_id = compose_win.draft_id();
+            let pool = draft_pool.clone();
+            runtime::spawn_async(
+                async move {
+                    let _ = mq_db::queries::drafts::upsert_draft(
+                        &pool, draft_id, account_id,
+                        &to, &cc, &bcc, &subject, &body,
+                        "new", None,
+                    ).await;
+                },
+                |_| {},
+            );
+        });
+    }
 
     let (in_reply_to, references) = MqComposeWindow::reply_headers(&mode);
 
@@ -3344,10 +3470,16 @@ fn wire_search(
             >| match result {
                 Ok((messages, emails, show_badge)) => {
                     let objects = make_message_objects(&messages, &emails, show_badge);
+                    let is_empty = objects.is_empty();
                     *msgs.borrow_mut() = messages;
+                    if is_empty {
+                        ml_inner.set_placeholder_text("No results found", "Try a different search term");
+                    }
                     ml_inner.set_messages(objects);
                     ml_inner.set_mailbox_title("Search Results");
-                    mv.show_placeholder();
+                    if is_empty {
+                        mv.show_placeholder();
+                    }
                 }
                 Err(e) => {
                     warn!("Search error: {e}");
@@ -3501,6 +3633,18 @@ fn send_new_mail_notification(app: &adw::Application, sender: &str, subject: &st
     let body = format!("{sender}: {subject}");
     notification.set_body(Some(&body));
     app.send_notification(Some("new-mail"), &notification);
+}
+
+/// Set context-aware placeholder text for an empty mailbox.
+fn set_mailbox_placeholder(ml: &crate::widgets::message_list::MqMessageList, mailbox: &str) {
+    match mailbox {
+        "[Gmail]/Drafts" => ml.set_placeholder_text("No drafts", "Press Ctrl+N to compose a new message"),
+        "[Gmail]/Trash" => ml.set_placeholder_text("No deleted messages", "Messages you delete will appear here"),
+        "[Gmail]/Starred" => ml.set_placeholder_text("No starred messages", "Press S to star important messages"),
+        "[Gmail]/Spam" => ml.set_placeholder_text("No spam", "Messages marked as spam will appear here"),
+        "[Gmail]/Sent Mail" => ml.set_placeholder_text("No sent messages", "Messages you send will appear here"),
+        _ => ml.reset_placeholder(),
+    }
 }
 
 fn format_sender(msg: &MessageObject) -> String {

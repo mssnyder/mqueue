@@ -51,7 +51,7 @@ pub enum ComposeMode {
 mod imp {
     use super::*;
 
-    #[derive(Debug, Default)]
+    #[derive(Default)]
     pub struct MqComposeWindow {
         pub from_dropdown: RefCell<Option<gtk::DropDown>>,
         pub to_entry: RefCell<Option<gtk::Entry>>,
@@ -73,6 +73,14 @@ mod imp {
         pub sent_successfully: std::cell::Cell<bool>,
         /// Draft ID if this compose is backed by a saved draft.
         pub draft_id: RefCell<Option<i64>>,
+        /// Callback to save the compose content as a draft.
+        pub save_draft_callback: RefCell<Option<Box<dyn Fn(&super::MqComposeWindow)>>>,
+    }
+
+    impl std::fmt::Debug for MqComposeWindow {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("MqComposeWindow").finish_non_exhaustive()
+        }
     }
 
     #[glib::object_subclass]
@@ -348,22 +356,37 @@ mod imp {
                 return self.parent_close_request();
             }
 
-            // Show discard confirmation dialog
+            // Show save/discard confirmation dialog
             let win = window.clone();
+            let has_save = self.save_draft_callback.borrow().is_some();
             let dialog = adw::AlertDialog::builder()
-                .heading("Discard draft?")
-                .body("Your message has not been sent. Discard it?")
+                .heading("Save draft?")
+                .body("Your message has not been sent.")
                 .close_response("cancel")
-                .default_response("cancel")
+                .default_response(if has_save { "save" } else { "cancel" })
                 .build();
             dialog.add_response("cancel", "Cancel");
+            if has_save {
+                dialog.add_response("save", "Save Draft");
+                dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+            }
             dialog.add_response("discard", "Discard");
             dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
 
             dialog.connect_response(None, move |_, response| {
-                if response == "discard" {
-                    win.imp().sent_successfully.set(true); // skip re-prompt
-                    win.close();
+                match response {
+                    "save" => {
+                        if let Some(ref cb) = *win.imp().save_draft_callback.borrow() {
+                            cb(&win);
+                        }
+                        win.imp().sent_successfully.set(true);
+                        win.close();
+                    }
+                    "discard" => {
+                        win.imp().sent_successfully.set(true);
+                        win.close();
+                    }
+                    _ => {} // cancel — do nothing
                 }
             });
 
@@ -552,6 +575,11 @@ impl MqComposeWindow {
     /// Set the draft ID.
     pub fn set_draft_id(&self, id: i64) {
         *self.imp().draft_id.borrow_mut() = Some(id);
+    }
+
+    /// Set the callback invoked when the user chooses "Save Draft" on close.
+    pub fn set_save_draft_callback<F: Fn(&Self) + 'static>(&self, f: F) {
+        *self.imp().save_draft_callback.borrow_mut() = Some(Box::new(f));
     }
 
     /// Set the available contacts for autocomplete in address fields.

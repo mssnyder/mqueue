@@ -110,6 +110,21 @@ pub fn setup_actions(app: &adw::Application, window: &crate::widgets::window::Mq
     });
     window.add_action(&read_toggle_action);
 
+    // Next/previous message navigation
+    let next_msg_action = gio::SimpleAction::new("next-message", None);
+    let window_clone = window.clone();
+    next_msg_action.connect_activate(move |_, _| {
+        window_clone.activate_next_message();
+    });
+    window.add_action(&next_msg_action);
+
+    let prev_msg_action = gio::SimpleAction::new("prev-message", None);
+    let window_clone = window.clone();
+    prev_msg_action.connect_activate(move |_, _| {
+        window_clone.activate_prev_message();
+    });
+    window.add_action(&prev_msg_action);
+
     // --- Set accelerators ---
     app.set_accels_for_action("app.quit", &["<Control>q"]);
     app.set_accels_for_action("app.preferences", &["<Control>comma"]);
@@ -123,6 +138,8 @@ pub fn setup_actions(app: &adw::Application, window: &crate::widgets::window::Mq
     app.set_accels_for_action("win.archive", &["e"]);
     app.set_accels_for_action("win.star", &["s"]);
     app.set_accels_for_action("win.read-toggle", &["<Shift>u"]);
+    app.set_accels_for_action("win.next-message", &["j"]);
+    app.set_accels_for_action("win.prev-message", &["k"]);
 }
 
 /// Show the keyboard shortcuts window.
@@ -154,6 +171,8 @@ fn show_shortcuts_window(window: &crate::widgets::window::MqWindow) {
     add_shortcut(&messages_group, "e", "Archive");
     add_shortcut(&messages_group, "s", "Star");
     add_shortcut(&messages_group, "<Shift>u", "Toggle read/unread");
+    add_shortcut(&messages_group, "j", "Next message");
+    add_shortcut(&messages_group, "k", "Previous message");
     section.append(&messages_group);
 
     let shortcuts_window = gtk::ShortcutsWindow::builder()
