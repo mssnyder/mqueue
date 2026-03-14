@@ -242,6 +242,16 @@ impl MqWindow {
         }
     }
 
+    /// Get the current banner button label (if any).
+    pub fn banner_button_label(&self) -> Option<String> {
+        self.imp()
+            .banner
+            .borrow()
+            .as_ref()
+            .and_then(|b| b.button_label())
+            .map(|s| s.to_string())
+    }
+
     /// Hide the banner.
     pub fn hide_banner(&self) {
         if let Some(banner) = self.imp().banner.borrow().clone() {

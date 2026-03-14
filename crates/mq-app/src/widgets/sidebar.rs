@@ -457,15 +457,21 @@ impl MqSidebar {
         }
     }
 
-    /// Update unread count badges on mailbox rows.
+    /// Update unread count badges on mailbox and label rows.
     pub fn update_unread_counts(&self, counts: &std::collections::HashMap<String, i64>) {
-        if let Some(list_box) = self.imp().mailbox_list.borrow().as_ref() {
+        // Update both mailbox rows and label rows
+        for list_box in [
+            self.imp().mailbox_list.borrow().as_ref().cloned(),
+            self.imp().label_list.borrow().as_ref().cloned(),
+        ]
+        .into_iter()
+        .flatten()
+        {
             let mut i = 0;
             while let Some(row) = list_box.row_at_index(i) {
                 let mailbox = row.widget_name().to_string();
                 if let Some(child) = row.child() {
                     if let Ok(hbox) = child.downcast::<gtk::Box>() {
-                        // Find the badge label by widget name
                         let mut c = hbox.first_child();
                         while let Some(widget) = c {
                             if widget.widget_name() == "unread_badge" {

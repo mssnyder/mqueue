@@ -1080,12 +1080,18 @@ fn setup_ui(window: MqWindow, data: AppData) -> Rc<RefCell<Vec<MessageData>>> {
     // Wire network awareness (offline banner + reconnect)
     wire_network_awareness(&window, &pool, &account_emails, is_multi_account, &shared_messages);
 
-    // Wire the banner's action button to trigger a re-sync (used for sync error retry)
+    // Wire the banner's action button: Retry → re-sync, Re-authenticate → add account flow
     {
         let w = window.clone();
+        let p = pool.clone();
         window.connect_banner_button(move || {
+            let banner_label = w.banner_button_label().unwrap_or_default();
             w.hide_banner();
-            adw::prelude::ActionGroupExt::activate_action(&w, "app.resync", None);
+            if banner_label.contains("Re-authenticate") {
+                show_account_setup(&w, &p);
+            } else {
+                adw::prelude::ActionGroupExt::activate_action(&w, "app.resync", None);
+            }
         });
     }
 
@@ -1263,13 +1269,13 @@ fn start_background_sync(
                         match ImapSession::connect(&email, &new_token).await {
                             Ok(s) => s,
                             Err(e2) => {
-                                let _ = tx.send(SyncProgress::Error(format!("IMAP connect failed after token refresh: {e2}"))).await;
+                                let _ = tx.send(SyncProgress::Error { message: format!("IMAP connect failed after token refresh: {e2}"), is_auth: true }).await;
                                 return;
                             }
                         }
                     }
                     Err(refresh_err) => {
-                        let _ = tx.send(SyncProgress::Error(format!("IMAP connect failed: {e} (token refresh also failed: {refresh_err})"))).await;
+                        let _ = tx.send(SyncProgress::Error { message: format!("IMAP connect failed: {e} (token refresh also failed: {refresh_err})"), is_auth: true }).await;
                         return;
                     }
                 }
@@ -1585,7 +1591,7 @@ fn start_background_sync(
                                         maybe_session = idle_loop(s, "INBOX", event_tx.clone(), new_cancel_rx).await;
                                     }
                                     None => {
-                                        let _ = idle_tx.send(SyncProgress::Error("IDLE connection lost during sync".into())).await;
+                                        let _ = idle_tx.send(SyncProgress::Error { message: "IDLE connection lost during sync".into(), is_auth: false }).await;
                                         break;
                                     }
                                 }
@@ -1681,7 +1687,7 @@ fn start_background_sync(
                             maybe_session = idle_loop(s, "INBOX", event_tx.clone(), new_cancel_rx).await;
                         }
                         None => {
-                            let _ = tx.send(SyncProgress::Error("Lost connection during sync".into())).await;
+                            let _ = tx.send(SyncProgress::Error { message: "Lost connection during sync".into(), is_auth: false }).await;
                             break;
                         }
                     }
@@ -1701,7 +1707,7 @@ fn start_background_sync(
                     let new_token = match mq_core::keyring::refresh_and_store(&email).await {
                         Ok(t) => t,
                         Err(e) => {
-                            let _ = tx.send(SyncProgress::Error(format!("Reconnect failed: {e}"))).await;
+                            let _ = tx.send(SyncProgress::Error { message: format!("Reconnect failed: {e}"), is_auth: true }).await;
                             break;
                         }
                     };
@@ -1713,7 +1719,7 @@ fn start_background_sync(
                             maybe_session = idle_loop(s, "INBOX", event_tx.clone(), new_cancel_rx).await;
                         }
                         Err(e) => {
-                            let _ = tx.send(SyncProgress::Error(format!("Reconnect failed: {e}"))).await;
+                            let _ = tx.send(SyncProgress::Error { message: format!("Reconnect failed: {e}"), is_auth: false }).await;
                             break;
                         }
                     }
@@ -1752,15 +1758,15 @@ fn start_background_sync(
                     );
                     refresh_message_list_from_db(&w, &p, &sm);
                 }
-                SyncProgress::Error(msg) => {
+                SyncProgress::Error { message: msg, is_auth } => {
                     error!("Background sync error: {msg}");
                     w.hide_progress();
-                    let is_auth = msg.to_lowercase().contains("token")
-                        || msg.to_lowercase().contains("auth")
-                        || msg.to_lowercase().contains("refresh");
                     if is_auth {
-                        // Show persistent auth error banner
-                        w.show_banner("Session expired. Please re-authenticate via the sidebar.");
+                        // Show auth error with actionable re-authenticate button
+                        w.show_banner_with_action(
+                            "Session expired. Click to re-authenticate.",
+                            "Re-authenticate",
+                        );
                     } else {
                         // Show error with retry button (no auto-dismiss)
                         w.show_banner_with_action(&format!("Sync error: {msg}"), "Retry");
@@ -1810,7 +1816,7 @@ struct NewMailInfo {
 enum SyncProgress {
     Status(String),
     Count(usize, usize),
-    Error(String),
+    Error { message: String, is_auth: bool },
     /// Sync complete. Carries new inbox messages for notification display.
     Done(Vec<NewMailInfo>),
     /// IDLE detected new mail — show a brief indicator.
@@ -1853,7 +1859,7 @@ async fn run_idle_sync(
         Ok(o) => o,
         Err(e) => {
             tracing::warn!(error = %e, "IDLE sync failed");
-            let _ = tx.send(SyncProgress::Error(format!("Sync failed: {e}"))).await;
+            let _ = tx.send(SyncProgress::Error { message: format!("Sync failed: {e}"), is_auth: false }).await;
             return (None, vec![]);
         }
     };
@@ -3839,6 +3845,9 @@ fn wire_network_awareness(
 ///
 /// Each notification shows the sender and subject, with a unique ID
 /// so they can be individually dismissed.
+///
+/// Note: GNOME Shell only shows "Open" (default action) and "Dismiss"
+/// for GNotification. Custom action buttons require KDE or other DEs.
 fn send_per_message_notifications(app: &adw::Application, messages: &[NewMailInfo]) {
     // Limit to 5 notifications to avoid flooding
     let max_notifications = 5;
@@ -3850,7 +3859,6 @@ fn send_per_message_notifications(app: &adw::Application, messages: &[NewMailInf
             format!("{}\n{}", msg.subject, msg.snippet)
         };
         notification.set_body(Some(&body));
-        // Default action: clicking notification activates the app
         notification.set_default_action("app.activate");
 
         // Unique notification ID per message

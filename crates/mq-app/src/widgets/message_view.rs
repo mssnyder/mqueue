@@ -71,6 +71,8 @@ mod imp {
         /// Metadata for thread messages: (db_id, uid, account_id, mailbox, is_read).
         /// Used by the expand callback to mark messages as read.
         pub thread_message_meta: RefCell<Vec<(i64, u32, i64, String, bool)>>,
+        /// Whether the threadExpand script message handler has been registered.
+        pub thread_handler_registered: std::cell::Cell<bool>,
     }
 
     impl std::fmt::Debug for MqMessageView {
@@ -654,7 +656,7 @@ impl MqMessageView {
             "white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
             "details[open] .thread-snippet { display: none; }",
             ".thread-body { padding: 16px 24px 20px; font-size: 18px; line-height: 1.6; }",
-            "img { max-width: 100%; height: auto; }",
+            "img { max-width: 100% !important; width: auto !important; height: auto !important; }",
             "details.mq-quote { margin-top: 16px; }",
             "details.mq-quote > summary { cursor: pointer; font-size: 16px; ",
             "padding: 12px 20px; border-radius: 8px; ",
@@ -801,19 +803,23 @@ impl MqMessageView {
                 settings.set_enable_javascript_markup(true);
             }
 
-            // Register the script message handler for thread expansion
-            let ucm = wv.user_content_manager().unwrap();
-            ucm.register_script_message_handler("threadExpand", None);
-            let callback = imp.thread_expand_callback.clone();
-            ucm.connect_script_message_received(Some("threadExpand"), move |_ucm, value| {
-                if let Some(ref cb) = *callback.borrow() {
-                    let idx_str: String = format!("{}", value);
-                    let idx_str = idx_str.trim_matches('"');
-                    if let Ok(idx) = idx_str.parse::<u32>() {
-                        cb(idx);
+            // Register the script message handler only once to avoid
+            // duplicate signal connections that cause multiple firings.
+            if !imp.thread_handler_registered.get() {
+                let ucm = wv.user_content_manager().unwrap();
+                ucm.register_script_message_handler("threadExpand", None);
+                let callback = imp.thread_expand_callback.clone();
+                ucm.connect_script_message_received(Some("threadExpand"), move |_ucm, value| {
+                    if let Some(ref cb) = *callback.borrow() {
+                        let idx_str: String = format!("{}", value);
+                        let idx_str = idx_str.trim_matches('"');
+                        if let Ok(idx) = idx_str.parse::<u32>() {
+                            cb(idx);
+                        }
                     }
-                }
-            });
+                });
+                imp.thread_handler_registered.set(true);
+            }
         }
 
         self.load_html_into_webview(&full_html);
@@ -1129,9 +1135,13 @@ impl MqMessageView {
                 settings.set_enable_javascript(false);
                 settings.set_enable_javascript_markup(false);
             }
-            // Unregister thread expand handler to avoid duplicate registrations
-            let ucm = wv.user_content_manager().unwrap();
-            ucm.unregister_script_message_handler("threadExpand", None);
+            // Unregister thread expand handler so it can be re-registered
+            // next time a thread is loaded.
+            if self.imp().thread_handler_registered.get() {
+                let ucm = wv.user_content_manager().unwrap();
+                ucm.unregister_script_message_handler("threadExpand", None);
+                self.imp().thread_handler_registered.set(false);
+            }
         }
     }
 }
@@ -1306,7 +1316,7 @@ fn webview_base_style(already_dark: bool) -> String {
             // Center email content that uses max-width
             "body > table, body > div, body > center {{ ",
             "margin-left: auto !important; margin-right: auto !important; }}",
-            "img {{ max-width: 100% !important; height: auto !important; }}",
+            "img {{ max-width: 100% !important; width: auto !important; height: auto !important; }}",
             "a {{ color: {link}; }}",
             "blockquote {{ border-left: 3px solid {qb}; margin: 8px 0; padding-left: 12px; color: {qt}; }}",
             "pre {{ white-space: pre-wrap; word-wrap: break-word; font-size: 16px; }}",

@@ -4,6 +4,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use super::message_object::MessageObject;
 
@@ -122,7 +123,13 @@ mod imp {
                 list_item.set_child(Some(&row));
             });
 
-            factory.connect_bind(|_, list_item| {
+            // Store notify handler IDs so we can disconnect on unbind.
+            // Each list item gets its own Rc<RefCell<...>> to hold the signal ID.
+            let bind_handler_ids: Rc<RefCell<Vec<(glib::Object, glib::SignalHandlerId)>>> =
+                Rc::new(RefCell::new(Vec::new()));
+            let bind_ids = bind_handler_ids.clone();
+
+            factory.connect_bind(move |_, list_item| {
                 let list_item = list_item
                     .downcast_ref::<gtk::ListItem>()
                     .expect("ListItem expected");
@@ -135,6 +142,33 @@ mod imp {
                     .and_downcast::<gtk::Box>()
                     .expect("Box expected");
                 bind_message_row(&row, &msg);
+
+                // Connect to is-read property changes so the row updates live
+                let row_clone = row.clone();
+                let handler_id = msg.connect_notify_local(Some("is-read"), move |m, _| {
+                    update_read_css(&row_clone, m.is_read());
+                });
+                bind_ids.borrow_mut().push((msg.upcast::<glib::Object>(), handler_id));
+            });
+
+            let unbind_ids = bind_handler_ids;
+            factory.connect_unbind(move |_, list_item| {
+                let list_item = list_item
+                    .downcast_ref::<gtk::ListItem>()
+                    .expect("ListItem expected");
+                if let Some(msg) = list_item.item() {
+                    let mut ids = unbind_ids.borrow_mut();
+                    // Disconnect handlers for this item and remove them
+                    let mut i = 0;
+                    while i < ids.len() {
+                        if ids[i].0 == msg {
+                            let (obj, id) = ids.remove(i);
+                            obj.disconnect(id);
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
             });
 
             // Create the ListView
@@ -381,6 +415,30 @@ fn bind_message_row(row: &gtk::Box, msg: &MessageObject) {
         } else {
             account.set_label(&email);
             account.set_visible(true);
+        }
+    }
+}
+
+/// Update bold CSS classes on sender/subject based on read state.
+fn update_read_css(row: &gtk::Box, is_read: bool) {
+    if let Some(top_line) = row.first_child().and_downcast::<gtk::Box>() {
+        if let Some(sender) = find_child_by_name(&top_line, "sender") {
+            if let Ok(sender) = sender.downcast::<gtk::Label>() {
+                if is_read {
+                    sender.remove_css_class("bold-label");
+                } else {
+                    sender.add_css_class("bold-label");
+                }
+            }
+        }
+    }
+    if let Some(subject) = find_child_by_name(row, "subject") {
+        if let Ok(subject) = subject.downcast::<gtk::Label>() {
+            if is_read {
+                subject.remove_css_class("bold-label");
+            } else {
+                subject.add_css_class("bold-label");
+            }
         }
     }
 }
