@@ -72,7 +72,10 @@ impl OfflineQueue {
             OfflineOp::DeleteMessage { .. } => "delete_message",
             OfflineOp::SendEmail { .. } => "send_email",
         };
-        let payload = serde_json::to_string(&op).unwrap_or_default();
+        let payload = serde_json::to_string(&op)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(e)
+            })?;
 
         let id =
             mq_db::queries::offline_queue::enqueue_op(&self.pool, account_id, op_type, &payload)

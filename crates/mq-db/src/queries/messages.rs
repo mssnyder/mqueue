@@ -394,6 +394,62 @@ pub async fn get_threads_for_mailbox(
     Ok(result)
 }
 
+/// Like `get_threads_for_mailbox` but filtered to a specific account.
+pub async fn get_threads_for_account_mailbox(
+    pool: &SqlitePool,
+    account_id: i64,
+    mailbox: &str,
+    limit: i64,
+    offset: i64,
+) -> sqlx::Result<Vec<(DbMessage, i64)>> {
+    let rows: Vec<DbMessage> = sqlx::query_as::<_, DbMessage>(
+        "SELECT m.id, m.account_id, m.uid, m.mailbox, m.gmail_msg_id, m.gmail_thread_id,
+            m.message_id, m.in_reply_to, m.references_json,
+            m.sender_name, m.sender_email, m.recipient_to, m.recipient_cc,
+            m.subject, m.snippet, m.date, m.flags, m.has_attachments, m.body_structure,
+            m.list_unsubscribe, m.list_unsubscribe_post, m.modseq, m.uid_validity, m.cached_at
+        FROM messages m
+        INNER JOIN (
+            SELECT COALESCE(gmail_thread_id, -id) AS tid, MAX(date) AS max_date
+            FROM messages
+            WHERE mailbox = ? AND account_id = ?
+            GROUP BY tid
+        ) t ON COALESCE(m.gmail_thread_id, -m.id) = t.tid AND m.date = t.max_date
+        WHERE m.mailbox = ? AND m.account_id = ?
+        GROUP BY COALESCE(m.gmail_thread_id, -m.id)
+        ORDER BY m.date DESC
+        LIMIT ? OFFSET ?",
+    )
+    .bind(mailbox)
+    .bind(account_id)
+    .bind(mailbox)
+    .bind(account_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+
+    let mut result = Vec::with_capacity(rows.len());
+    for msg in rows {
+        let count: i64 = if let Some(tid) = msg.gmail_thread_id {
+            let row: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM messages WHERE gmail_thread_id = ? AND account_id = ?",
+            )
+            .bind(tid)
+            .bind(account_id)
+            .fetch_one(pool)
+            .await
+            .unwrap_or((1,));
+            row.0
+        } else {
+            1
+        };
+        result.push((msg, count));
+    }
+
+    Ok(result)
+}
+
 /// Get all messages in a thread, ordered oldest-first (conversation view).
 pub async fn get_thread_messages(
     pool: &SqlitePool,

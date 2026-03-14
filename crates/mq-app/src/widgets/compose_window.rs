@@ -273,6 +273,7 @@ mod imp {
                                             let filename = path.file_name()
                                                 .map(|n: &std::ffi::OsStr| n.to_string_lossy().to_string())
                                                 .unwrap_or_else(|| "file".to_string());
+                                            let path_for_remove = path.clone();
                                             att_list.borrow_mut().push((filename.clone(), path));
 
                                             // Add row to UI
@@ -299,11 +300,12 @@ mod imp {
                                                 .build();
                                             let att_box2 = att_box.clone();
                                             let att_list2 = att_list.clone();
-                                            let fname = filename.clone();
+                                            let att_path = path_for_remove;
                                             let row_ref = row.clone();
                                             remove_btn.connect_clicked(move |_| {
                                                 att_box2.remove(&row_ref);
-                                                att_list2.borrow_mut().retain(|(n, _)| n != &fname);
+                                                // Remove by path (unique) rather than filename (may have duplicates)
+                                                att_list2.borrow_mut().retain(|(_, p)| p != &att_path);
                                                 if att_list2.borrow().is_empty() {
                                                     att_box2.set_visible(false);
                                                 }
@@ -650,10 +652,14 @@ impl MqComposeWindow {
         }
     }
 
-    /// Set the body text.
+    /// Set the body text and place cursor at the beginning.
     pub fn set_body(&self, text: &str) {
         if let Some(tv) = self.imp().body_view.borrow().as_ref() {
-            tv.buffer().set_text(text);
+            let buf = tv.buffer();
+            buf.set_text(text);
+            // Place cursor at the very start so the user can type immediately
+            let start = buf.start_iter();
+            buf.place_cursor(&start);
         }
     }
 
@@ -817,14 +823,26 @@ impl MqComposeWindow {
                 let self_email = self.selected_account()
                     .map(|(_, e)| e.to_lowercase())
                     .unwrap_or_default();
-                // Merge original To + Cc into Cc (excluding the sender and self)
+                // Merge original To + Cc into Cc (excluding the sender and self).
+                // Addresses may be in "Name <email>" format, so extract just the
+                // email part for comparison.
+                let extract_email = |addr: &str| -> String {
+                    let addr = addr.trim();
+                    if let Some(start) = addr.find('<') {
+                        if let Some(end) = addr.find('>') {
+                            return addr[start + 1..end].to_lowercase();
+                        }
+                    }
+                    addr.to_lowercase()
+                };
+                let self_extracted = extract_email(&self_email);
+                let from_extracted = extract_email(from);
                 let mut all_cc: Vec<String> = to
                     .iter()
                     .chain(cc.iter())
-                    .filter(|a| a != &from)
+                    .filter(|a| extract_email(a) != from_extracted)
                     .filter(|a| {
-                        let lower = a.to_lowercase();
-                        !lower.contains(&self_email) || self_email.is_empty()
+                        self_extracted.is_empty() || extract_email(a) != self_extracted
                     })
                     .cloned()
                     .collect();

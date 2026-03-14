@@ -858,11 +858,22 @@ fn setup_ui(window: MqWindow, data: AppData) -> Rc<RefCell<Vec<MessageData>>> {
             let sort_newest = w.imp().sort_newest_first.get();
             runtime::spawn_async(
                 async move {
-                    mq_db::queries::messages::get_threads_for_mailbox(
-                        &pool, &mailbox, 200, current_count,
-                    )
-                    .await
-                    .unwrap_or_default()
+                    match account_id {
+                        Some(aid) => {
+                            mq_db::queries::messages::get_threads_for_account_mailbox(
+                                &pool, aid, &mailbox, 200, current_count,
+                            )
+                            .await
+                            .unwrap_or_default()
+                        }
+                        None => {
+                            mq_db::queries::messages::get_threads_for_mailbox(
+                                &pool, &mailbox, 200, current_count,
+                            )
+                            .await
+                            .unwrap_or_default()
+                        }
+                    }
                 },
                 move |threads: Vec<(mq_db::models::DbMessage, i64)>| {
                     if threads.is_empty() {
@@ -952,11 +963,32 @@ fn setup_ui(window: MqWindow, data: AppData) -> Rc<RefCell<Vec<MessageData>>> {
                             warn!(error = %e, "Failed to delete keyring tokens");
                         }
                         // Delete all account-related data from DB
+                        // First delete child tables that reference messages
+                        let _ = sqlx::query(
+                            "DELETE FROM message_bodies WHERE message_id IN (SELECT id FROM messages WHERE account_id = ?)"
+                        )
+                            .bind(account_id)
+                            .execute(&*pool)
+                            .await;
+                        let _ = sqlx::query(
+                            "DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE account_id = ?)"
+                        )
+                            .bind(account_id)
+                            .execute(&*pool)
+                            .await;
                         let _ = sqlx::query("DELETE FROM offline_queue WHERE account_id = ?")
                             .bind(account_id)
                             .execute(&*pool)
                             .await;
                         let _ = sqlx::query("DELETE FROM sender_image_allowlist WHERE account_id = ?")
+                            .bind(account_id)
+                            .execute(&*pool)
+                            .await;
+                        let _ = sqlx::query("DELETE FROM drafts WHERE account_id = ?")
+                            .bind(account_id)
+                            .execute(&*pool)
+                            .await;
+                        let _ = sqlx::query("DELETE FROM contacts WHERE account_id = ?")
                             .bind(account_id)
                             .execute(&*pool)
                             .await;
@@ -1719,7 +1751,7 @@ fn start_background_sync(
                             if let Some(adw_app) = app.downcast_ref::<adw::Application>() {
                                 send_new_mail_notification(
                                     adw_app,
-                                    &format!("{total} new"),
+                                    "New mail",
                                     &format!("{total} new message{}", if total == 1 { "" } else { "s" }),
                                 );
                             }
@@ -2203,14 +2235,27 @@ fn reload_messages(
     // Set context-aware placeholder text for this mailbox
     set_mailbox_placeholder(&ml, &mailbox);
 
+    let account_id_filter = account_id;
     runtime::spawn_async(
         async move {
-            // Use threaded query to group by gmail_thread_id
-            let threads = mq_db::queries::messages::get_threads_for_mailbox(
-                &pool, &mailbox, 200, 0,
-            )
-            .await
-            .unwrap_or_default();
+            // Use threaded query to group by gmail_thread_id.
+            // Filter by account_id if a specific account is selected.
+            let threads = match account_id_filter {
+                Some(aid) => {
+                    mq_db::queries::messages::get_threads_for_account_mailbox(
+                        &pool, aid, &mailbox, 200, 0,
+                    )
+                    .await
+                    .unwrap_or_default()
+                }
+                None => {
+                    mq_db::queries::messages::get_threads_for_mailbox(
+                        &pool, &mailbox, 200, 0,
+                    )
+                    .await
+                    .unwrap_or_default()
+                }
+            };
             (db_to_threaded_message_data(threads), emails, show_badge)
         },
         move |(messages, emails, show_badge): (
@@ -2612,6 +2657,17 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
 
             let pos = ml4.selection().selected();
             let has_remaining = ml4.model().n_items() > 1;
+
+            // Remove from shared_messages so the selection handler stays consistent
+            let removed_data: Option<MessageData> = {
+                let mut msgs = del_msgs.borrow_mut();
+                if let Some(idx) = msgs.iter().position(|m| m.db_id == db_id) {
+                    Some(msgs.remove(idx))
+                } else {
+                    None
+                }
+            };
+
             remove_selected(&ml4);
             if !has_remaining {
                 view4.show_placeholder();
@@ -2668,8 +2724,15 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
                 .build();
             let undo_ml = ml4.clone();
             let undo_execute = execute;
+            let undo_msgs = del_msgs.clone();
             toast.connect_button_clicked(move |_| {
                 undo_execute.set(false);
+                // Restore shared_messages data so the selection handler works
+                if let Some(ref data) = removed_data {
+                    let mut msgs = undo_msgs.borrow_mut();
+                    let insert_idx = pos.min(msgs.len() as u32) as usize;
+                    msgs.insert(insert_idx, data.clone());
+                }
                 undo_ml.insert_message_at(pos, &undo_msg);
                 undo_ml.selection().set_selected(pos);
             });
@@ -2700,6 +2763,17 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
 
             let pos = ml5.selection().selected();
             let has_remaining = ml5.model().n_items() > 1;
+
+            // Remove from shared_messages so the selection handler stays consistent
+            let removed_data: Option<MessageData> = {
+                let mut msgs = arch_msgs.borrow_mut();
+                if let Some(idx) = msgs.iter().position(|m| m.db_id == db_id) {
+                    Some(msgs.remove(idx))
+                } else {
+                    None
+                }
+            };
+
             remove_selected(&ml5);
             if !has_remaining {
                 view5.show_placeholder();
@@ -2752,8 +2826,15 @@ fn wire_action_buttons(window: &MqWindow, pool: &Arc<SqlitePool>, shared_message
                 .build();
             let undo_ml = ml5.clone();
             let undo_execute = execute;
+            let undo_msgs = arch_msgs.clone();
             toast.connect_button_clicked(move |_| {
                 undo_execute.set(false);
+                // Restore shared_messages data so the selection handler works
+                if let Some(ref data) = removed_data {
+                    let mut msgs = undo_msgs.borrow_mut();
+                    let insert_idx = pos.min(msgs.len() as u32) as usize;
+                    msgs.insert(insert_idx, data.clone());
+                }
                 undo_ml.insert_message_at(pos, &undo_msg);
                 undo_ml.selection().set_selected(pos);
             });
@@ -3035,7 +3116,8 @@ fn open_compose_impl(
 
         let to = compose_ref.to_addresses();
         if to.is_empty() {
-            warn!("No recipients specified");
+            let toast = adw::Toast::new("Please add at least one recipient");
+            send_window.show_toast(&toast);
             return;
         }
 
@@ -3628,10 +3710,9 @@ fn wire_network_awareness(
 ///
 /// Called when IDLE detects new messages after a sync. Will be wired
 /// into the full IDLE → sync → notify pipeline once token storage is complete.
-fn send_new_mail_notification(app: &adw::Application, sender: &str, subject: &str) {
-    let notification = gio::Notification::new("New mail");
-    let body = format!("{sender}: {subject}");
-    notification.set_body(Some(&body));
+fn send_new_mail_notification(app: &adw::Application, title: &str, body: &str) {
+    let notification = gio::Notification::new(title);
+    notification.set_body(Some(body));
     app.send_notification(Some("new-mail"), &notification);
 }
 
